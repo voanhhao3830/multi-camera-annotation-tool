@@ -405,8 +405,15 @@ class MultiCameraCanvas(QtWidgets.QWidget):
             Shape.scale = 1.0
             for shape in cell.shapes:
                 if self.isVisible(shape):
-                    # Set fill based on selection
-                    shape.fill = shape.selected or shape == self.hShape
+                    # Set fill based on selection or BEV highlight
+                    bev_highlighted = getattr(shape, '_bev_highlighted', False)
+                    shape.fill = shape.selected or shape == self.hShape or bev_highlighted
+                    
+                    # If BEV highlighted, use a different color
+                    original_line_color = None
+                    if bev_highlighted:
+                        original_line_color = shape.line_color
+                        shape.line_color = QtGui.QColor(255, 255, 0, 255)  # Yellow highlight
                     
                     # Transform shape points to global coordinates for drawing
                     original_points = shape.points.copy()
@@ -416,8 +423,10 @@ class MultiCameraCanvas(QtWidgets.QWidget):
                     
                     shape.paint(p)
                     
-                    # Restore original points
+                    # Restore original points and color
                     shape.points = original_points
+                    if original_line_color:
+                        shape.line_color = original_line_color
             
             # Draw selectedShapesCopy if any (for copy/move preview)
             # Set Shape.scale = 1.0 because we already transform points to global coordinates

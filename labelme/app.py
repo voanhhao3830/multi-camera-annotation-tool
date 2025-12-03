@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import html
+import json
 import math
 import os
 import os.path as osp
@@ -147,14 +148,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.labelList = LabelListWidget()
         self._prev_opened_dir = None
 
-        self.flag_dock = self.flag_widget = None
-        self.flag_dock = QtWidgets.QDockWidget(self.tr("Flags"), self)
-        self.flag_dock.setObjectName("Flags")
-        self.flag_widget = QtWidgets.QListWidget()
-        if config["flags"]:
-            self._load_flags(flags={k: False for k in config["flags"]})
-        self.flag_dock.setWidget(self.flag_widget)
-        self.flag_widget.itemChanged.connect(self.setDirty)
+        # Ground Point List (replaces flags widget)
+        self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
+        self.ground_point_dock.setObjectName("GroundPoints")
+        self.ground_point_widget = QtWidgets.QListWidget()
+        self.ground_point_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.ground_point_widget.customContextMenuRequested.connect(self._ground_point_context_menu)
+        self.ground_point_widget.itemEntered.connect(self._ground_point_hover)
+        self.ground_point_widget.itemSelectionChanged.connect(self._ground_point_selection_changed)
+        self.ground_point_widget.itemDoubleClicked.connect(self._ground_point_double_clicked)
+        self.ground_point_widget.setMouseTracking(True)
+        self.ground_point_widget.installEventFilter(self)  # For Delete key handling
+        self.ground_point_dock.setWidget(self.ground_point_widget)
+        
+        # Keep flag_widget reference for compatibility but point to ground point widget
+        self.flag_dock = self.ground_point_dock
+        self.flag_widget = self.ground_point_widget
 
         self.labelList.itemSelectionChanged.connect(self._label_selection_changed)
         self.labelList.itemDoubleClicked.connect(self._edit_label)
@@ -1662,7 +1671,247 @@ class MainWindow(QtWidgets.QMainWindow):
                 logger.error(f"Error saving label file {label_file}: {e}")
                 success = False
         
+        # Save global annotation format
+        if success:
+            self._save_global_annotations()
+        
         return success
+
+    def eventFilter(self, obj, event):
+        """Handle Delete key press in ground point widget"""
+        if obj == self.ground_point_widget and event.type() == QtCore.QEvent.KeyPress:
+            if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                current_item = self.ground_point_widget.currentItem()
+                if current_item:
+                    group_id = current_item.data(Qt.UserRole)
+                    self._delete_ground_point(group_id)
+                    return True
+        return super().eventFilter(obj, event)
+    
+    def _ground_point_double_clicked(self, item):
+        """Handle double-click on ground point to delete it"""
+        if item:
+            group_id = item.data(Qt.UserRole)
+            self._delete_ground_point(group_id)
+    
+    def _ground_point_context_menu(self, point):
+        """Show context menu for ground point (BEV point)"""
+        menu = QtWidgets.QMenu()
+        delete_action = menu.addAction("Delete Ground Point")
+        action = menu.exec_(self.ground_point_widget.mapToGlobal(point))
+        
+        if action == delete_action:
+            current_item = self.ground_point_widget.currentItem()
+            if current_item:
+                group_id = current_item.data(Qt.UserRole)
+                self._delete_ground_point(group_id)
+    
+    def _ground_point_hover(self, item):
+        """Highlight bounding boxes when hovering over ground point"""
+        if not item or not self.multi_camera_canvas:
+            return
+        
+        group_id = item.data(Qt.UserRole)
+        self._highlight_shapes_by_group_id(group_id, highlight=True)
+    
+    def _ground_point_selection_changed(self):
+        """Highlight bounding boxes when ground point is selected"""
+        if not self.multi_camera_canvas:
+            return
+        
+        # Clear all highlights first
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                if hasattr(shape, '_bev_highlighted'):
+                    shape._bev_highlighted = False
+        
+        # Highlight selected
+        selected_items = self.ground_point_widget.selectedItems()
+        if selected_items:
+            group_id = selected_items[0].data(Qt.UserRole)
+            self._highlight_shapes_by_group_id(group_id, highlight=True)
+        
+        self.multi_camera_canvas.update()
+    
+    def _highlight_shapes_by_group_id(self, group_id: int, highlight: bool = True):
+        """Highlight all shapes with the given group_id"""
+        if not self.multi_camera_canvas:
+            return
+        
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                if shape.group_id == group_id:
+                    shape._bev_highlighted = highlight
+        
+        self.multi_camera_canvas.update()
+    
+    def _delete_ground_point(self, group_id: int):
+        """Delete ground point and all related bounding boxes"""
+        if not self.multi_camera_canvas or not self.bev_canvas:
+            return
+        
+        # Delete from BEV canvas
+        boxes_to_remove = []
+        for idx, (center, size, rotation, label, box_group_id) in enumerate(self.bev_canvas.boxes_3d):
+            if box_group_id == group_id:
+                boxes_to_remove.append(idx)
+        
+        # Remove boxes in reverse order to maintain indices
+        for idx in reversed(boxes_to_remove):
+            del self.bev_canvas.boxes_3d[idx]
+        
+        # Delete from all cameras
+        for idx, cell in enumerate(self.multi_camera_canvas.camera_cells):
+            shapes_to_remove = []
+            for shape in cell.shapes:
+                if shape.group_id == group_id:
+                    shapes_to_remove.append(shape)
+            
+            for shape in shapes_to_remove:
+                cell.shapes.remove(shape)
+                self.remLabels([shape])
+            
+            self.multi_camera_canvas.camera_cells[idx] = cell
+        
+        # Update displays
+        self.bev_canvas.update()
+        self.multi_camera_canvas.update()
+        self._update_ground_point_list()
+        self.setDirty()
+    
+    def _update_ground_point_list(self):
+        """Update the ground point list widget"""
+        self.ground_point_widget.clear()
+        
+        if not self.bev_canvas or not self.bev_canvas.boxes_3d:
+            return
+        
+        for center, size, rotation, label, group_id in self.bev_canvas.boxes_3d:
+            if group_id is None:
+                continue
+            
+            # Format: "ID 1: (10.5, 15.2) - person"
+            text = f"ID {group_id}: ({center[0]:.1f}, {center[1]:.1f}m) - {label}"
+            item = QtWidgets.QListWidgetItem(text)
+            item.setData(Qt.UserRole, group_id)
+            self.ground_point_widget.addItem(item)
+    
+    def _get_next_group_id(self) -> int:
+        """Get next unique group_id"""
+        max_id = 0
+        
+        # Check BEV boxes
+        if self.bev_canvas and self.bev_canvas.boxes_3d:
+            for _, _, _, _, group_id in self.bev_canvas.boxes_3d:
+                if group_id is not None and group_id > max_id:
+                    max_id = group_id
+        
+        # Check shapes in all cameras
+        if self.multi_camera_canvas:
+            for cell in self.multi_camera_canvas.camera_cells:
+                for shape in cell.shapes:
+                    if shape.group_id is not None and shape.group_id > max_id:
+                        max_id = shape.group_id
+        
+        return max_id + 1
+
+    def _save_global_annotations(self) -> None:
+        """Save global annotations in annotation_position folder"""
+        if not self.multi_camera_canvas or not self.multi_camera_data or not self.filename:
+            return
+        
+        # Extract frame index from filename (e.g., "Frame_0001" -> "00000001")
+        try:
+            if self.filename.startswith("Frame_"):
+                frame_index = int(self.filename.split("_")[1])
+                frame_id = f"{frame_index:08d}"
+            else:
+                frame_id = "00000000"
+        except (ValueError, IndexError):
+            logger.warning(f"Could not parse frame index from {self.filename}")
+            return
+        
+        # Find the root directory (parent of Image_subsets)
+        if hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+            root_dir = osp.dirname(self._multi_camera_root_dirs[0])
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        else:
+            return
+        
+        # Create annotation_position folder
+        annotation_dir = osp.join(root_dir, "annotation_position")
+        if not osp.exists(annotation_dir):
+            os.makedirs(annotation_dir)
+        
+        # Aggregate shapes by group_id (personID)
+        persons = {}  # group_id -> person data
+        
+        for camera_idx, cam_data in enumerate(self.multi_camera_data):
+            cell = self.multi_camera_canvas.camera_cells[camera_idx]
+            
+            for shape in cell.shapes:
+                if shape.group_id is None:
+                    continue
+                
+                person_id = shape.group_id
+                
+                # Initialize person if not exists
+                if person_id not in persons:
+                    persons[person_id] = {
+                        "personID": person_id,
+                        "ground_points": [-1, -1],  # Will be updated from BEV if available
+                        "views": []
+                    }
+                    # Initialize all views with -1
+                    for view_num in range(len(self.multi_camera_data)):
+                        persons[person_id]["views"].append({
+                            "viewNum": view_num,
+                            "xmin": -1,
+                            "ymin": -1,
+                            "xmax": -1,
+                            "ymax": -1
+                        })
+                
+                # Extract bounding box for this view
+                if shape.shape_type == "rectangle" and len(shape.points) >= 2:
+                    x_coords = [shape.points[0].x(), shape.points[1].x()]
+                    y_coords = [shape.points[0].y(), shape.points[1].y()]
+                    xmin = int(min(x_coords))
+                    ymin = int(min(y_coords))
+                    xmax = int(max(x_coords))
+                    ymax = int(max(y_coords))
+                    
+                    # Update the view for this camera
+                    persons[person_id]["views"][camera_idx] = {
+                        "viewNum": camera_idx,
+                        "xmin": xmin,
+                        "ymin": ymin,
+                        "xmax": xmax,
+                        "ymax": ymax
+                    }
+        
+        # Update ground_points from BEV 3D boxes if available
+        if self.bev_canvas and self.bev_canvas.boxes_3d:
+            for center, size, rotation, label, group_id in self.bev_canvas.boxes_3d:
+                if group_id in persons:
+                    # Use center x, y as ground points (in centimeters)
+                    persons[group_id]["ground_points"] = [
+                        int(center[0] * 100),  # Convert meters to centimeters
+                        int(center[1] * 100)
+                    ]
+        
+        # Convert to list format
+        annotations = list(persons.values())
+        
+        # Save to JSON file
+        output_file = osp.join(annotation_dir, f"{frame_id}.json")
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(annotations, f, indent=4)
+            logger.info(f"Saved global annotations: {output_file}")
+        except Exception as e:
+            logger.error(f"Failed to save global annotations: {e}")
 
     def duplicateSelectedShape(self):
         self.copySelectedShape()
@@ -2749,6 +2998,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     logger.warning(f"Failed to load label file {label_file}: {e}")
         
         self.multi_camera_canvas.update()
+        self._update_ground_point_list()
         self.setClean()
         self.toggleActions(True)
         self.filename = f"Frame_{frame_index:04d}"
@@ -2900,11 +3150,15 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_bev_box_placed(self, x: float, y: float, z: float, w: float, h: float, d: float):
         """Handle box placement from BEV canvas"""
+        # Get next unique group_id
+        next_group_id = self._get_next_group_id()
+        
         # Show dialog to get label and group_id
         dialog = Box3DDialog(
             self,
             x=x, y=y, z=z,
-            w=w, h=h, d=d
+            w=w, h=h, d=d,
+            group_id=next_group_id
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
@@ -2914,12 +3168,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 logger.warning("Label is required")
                 return
             
+            # Ensure group_id is set
+            if group_id is None:
+                group_id = next_group_id
+            
             # Project 3D box to 2D for each camera
             self._project_3d_box_to_cameras(x, y, z, w, h, d, label, group_id)
             
             # Add to BEV canvas
             if self.bev_canvas:
                 self.bev_canvas.addBox3D(x, y, z, w, h, d, label, group_id)
+            
+            # Update ground point list
+            self._update_ground_point_list()
     
     def _on_bev_box_moved(self, box_idx: int, x: float, y: float, z: float):
         """Handle box movement from BEV canvas (via arrow keys)"""
@@ -3037,6 +3298,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.multi_camera_canvas.camera_cells[idx] = cell
         
         self.multi_camera_canvas.update()
+        self._update_ground_point_list()
         self.setDirty()
     
     def _project_3d_box_to_cameras(self, x: float, y: float, z: float, 
