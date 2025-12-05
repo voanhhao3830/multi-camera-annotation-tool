@@ -1,7 +1,29 @@
 {
   "version": "5.10.0",
-  "flags": {},
-  "shapes": [],
+  "flags": {
+    "ID 1: (-709.8, -1277.6m) - object": false
+  },
+  "shapes": [
+    {
+      "from_bev": true,
+      "label": "object",
+      "points": [
+        [
+          956.4508056640625,
+          98.55909729003906
+        ],
+        [
+          993.9154663085938,
+          180.11668395996094
+        ]
+      ],
+      "group_id": 1,
+      "description": null,
+      "shape_type": "rectangle",
+      "flags": null,
+      "mask": null
+    }
+  ],
   "imagePath": "00000000.png",
   "imageData": null,
   "imageHeight": 1080,

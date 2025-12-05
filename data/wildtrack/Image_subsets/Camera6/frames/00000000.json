@@ -1,6 +1,8 @@
 {
   "version": "5.10.0",
-  "flags": {},
+  "flags": {
+    "ID 1: (-709.8, -1277.6m) - object": false
+  },
   "shapes": [],
   "imagePath": "00000000.png",
   "imageData": null,

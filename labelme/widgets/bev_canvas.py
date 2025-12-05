@@ -43,6 +43,12 @@ class BEVCanvas(QtWidgets.QWidget):
         self.selected_box_idx: Optional[int] = None
         self.hovered_box_idx: Optional[int] = None
         
+        # Points: list of (x, y, label, group_id) - for simple markers on BEV
+        self.points: list[tuple] = []
+        self.selected_point_idx: Optional[int] = None
+        self.hovered_point_idx: Optional[int] = None
+        self.point_radius = 8  # radius in pixels
+        
         # Drawing state
         self.drawing_box = False
         self.drawing_start_pos: Optional[QPointF] = None
@@ -120,6 +126,31 @@ class BEVCanvas(QtWidgets.QWidget):
         self.selected_box_idx = None
         self.hovered_box_idx = None
         self.update()
+    
+    def addPoint(self, x: float, y: float, label: str = "object", group_id: int = None):
+        """Add a point marker to the BEV canvas"""
+        self.points.append((x, y, label, group_id))
+        self.update()
+    
+    def clearPoints(self):
+        """Clear all points"""
+        self.points = []
+        self.selected_point_idx = None
+        self.hovered_point_idx = None
+        self.update()
+    
+    def deletePointByGroupId(self, group_id: int) -> bool:
+        """Delete a point by group_id"""
+        for i, (x, y, label, gid) in enumerate(self.points):
+            if gid == group_id:
+                self.points.pop(i)
+                if self.selected_point_idx == i:
+                    self.selected_point_idx = None
+                elif self.selected_point_idx is not None and self.selected_point_idx > i:
+                    self.selected_point_idx -= 1
+                self.update()
+                return True
+        return False
     
     def _world_to_screen(self, x: float, y: float) -> QPointF:
         """Convert world coordinates to screen coordinates"""
@@ -374,6 +405,39 @@ class BEVCanvas(QtWidgets.QWidget):
             if label:
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
                 p.drawText(rect, Qt.AlignCenter, label)
+        
+        # Draw points (simple markers)
+        for idx, (x, y, label, group_id) in enumerate(self.points):
+            screen_pos = self._world_to_screen(x, y)
+            
+            # Determine color based on group_id for consistency
+            if group_id is not None:
+                # Use group_id to generate a consistent color
+                hue = (group_id * 67) % 360
+                color = QtGui.QColor.fromHsv(hue, 200, 255)
+            else:
+                color = self.box_color
+            
+            # Check if selected or hovered
+            if idx == self.selected_point_idx:
+                color = self.selected_box_color
+            elif idx == self.hovered_point_idx:
+                color = self.hovered_box_color
+            
+            # Draw filled circle
+            p.setPen(QtGui.QPen(color, 2))
+            p.setBrush(QtGui.QBrush(color, Qt.SolidPattern))
+            p.drawEllipse(screen_pos, self.point_radius, self.point_radius)
+            
+            # Draw label text next to point
+            if group_id is not None:
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
+                text_rect = QtCore.QRectF(
+                    screen_pos.x() + self.point_radius + 2,
+                    screen_pos.y() - 8,
+                    50, 16
+                )
+                p.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, str(group_id))
         
         # Draw current drawing box
         if self.drawing_box and self.drawing_start_pos:

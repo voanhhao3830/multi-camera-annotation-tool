@@ -147,6 +147,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.labelList = LabelListWidget()
         self._prev_opened_dir = None
+        self._aicv_root_dir = None  # Root directory for AICV folder structure
+        
+        # Calibration scale factors
+        self._intrinsic_scale_factor = 0.25  # Default 1/4 scale for K and optimalK
+        self._translation_scale_factor = 100.0  # Default scale for translation in extrinsic
+        
+        # BEV grid parameters
+        self._bev_x = 1200  # BEV grid X dimension (default 600*2)
+        self._bev_y = 800   # BEV grid Y dimension (default 400*2)
+        self._bev_bounds = [0, 600, 0, 400, 0, 200]  # [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
 
         # Ground Point List (replaces flags widget)
         self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
@@ -925,6 +935,83 @@ class MainWindow(QtWidgets.QMainWindow):
                 font_base=self.font(),
             ),
         )
+        
+        # Calibration scale factors toolbar
+        self._calib_toolbar = QtWidgets.QToolBar("BEV Settings")
+        self._calib_toolbar.setObjectName("CalibrationToolbar")
+        
+        # Intrinsic scale factor spinbox
+        calib_label1 = QtWidgets.QLabel(" K: ")
+        self._intrinsic_scale_spinbox = QtWidgets.QDoubleSpinBox()
+        self._intrinsic_scale_spinbox.setRange(0.01, 2.0)
+        self._intrinsic_scale_spinbox.setSingleStep(0.05)
+        self._intrinsic_scale_spinbox.setDecimals(3)
+        self._intrinsic_scale_spinbox.setValue(self._intrinsic_scale_factor)
+        self._intrinsic_scale_spinbox.setToolTip("Scale factor for K and optimalK (default 0.25)")
+        
+        # Translation scale factor spinbox
+        calib_label2 = QtWidgets.QLabel(" T: ")
+        self._translation_scale_spinbox = QtWidgets.QDoubleSpinBox()
+        self._translation_scale_spinbox.setRange(0.1, 1000.0)
+        self._translation_scale_spinbox.setSingleStep(10.0)
+        self._translation_scale_spinbox.setDecimals(1)
+        self._translation_scale_spinbox.setValue(self._translation_scale_factor)
+        self._translation_scale_spinbox.setToolTip("Scale factor for translation (default 100)")
+        
+        # BEV X dimension spinbox
+        bev_label_x = QtWidgets.QLabel(" X: ")
+        self._bev_x_spinbox = QtWidgets.QSpinBox()
+        self._bev_x_spinbox.setRange(100, 4000)
+        self._bev_x_spinbox.setSingleStep(100)
+        self._bev_x_spinbox.setValue(self._bev_x)
+        self._bev_x_spinbox.setToolTip("BEV grid X dimension (default 1200)")
+        
+        # BEV Y dimension spinbox
+        bev_label_y = QtWidgets.QLabel(" Y: ")
+        self._bev_y_spinbox = QtWidgets.QSpinBox()
+        self._bev_y_spinbox.setRange(100, 4000)
+        self._bev_y_spinbox.setSingleStep(100)
+        self._bev_y_spinbox.setValue(self._bev_y)
+        self._bev_y_spinbox.setToolTip("BEV grid Y dimension (default 800)")
+        
+        # Bounds: XMAX, YMAX
+        bounds_label_xmax = QtWidgets.QLabel(" XMAX: ")
+        self._bev_xmax_spinbox = QtWidgets.QSpinBox()
+        self._bev_xmax_spinbox.setRange(100, 2000)
+        self._bev_xmax_spinbox.setSingleStep(50)
+        self._bev_xmax_spinbox.setValue(self._bev_bounds[1])
+        self._bev_xmax_spinbox.setToolTip("BEV bounds XMAX (default 600)")
+        
+        bounds_label_ymax = QtWidgets.QLabel(" YMAX: ")
+        self._bev_ymax_spinbox = QtWidgets.QSpinBox()
+        self._bev_ymax_spinbox.setRange(100, 2000)
+        self._bev_ymax_spinbox.setSingleStep(50)
+        self._bev_ymax_spinbox.setValue(self._bev_bounds[3])
+        self._bev_ymax_spinbox.setToolTip("BEV bounds YMAX (default 400)")
+        
+        # Apply button
+        apply_calib_btn = QtWidgets.QPushButton("Apply")
+        apply_calib_btn.setToolTip("Apply settings and regenerate BEV")
+        apply_calib_btn.clicked.connect(self._apply_calibration_scales)
+        
+        self._calib_toolbar.addWidget(calib_label1)
+        self._calib_toolbar.addWidget(self._intrinsic_scale_spinbox)
+        self._calib_toolbar.addWidget(calib_label2)
+        self._calib_toolbar.addWidget(self._translation_scale_spinbox)
+        self._calib_toolbar.addSeparator()
+        self._calib_toolbar.addWidget(bev_label_x)
+        self._calib_toolbar.addWidget(self._bev_x_spinbox)
+        self._calib_toolbar.addWidget(bev_label_y)
+        self._calib_toolbar.addWidget(self._bev_y_spinbox)
+        self._calib_toolbar.addSeparator()
+        self._calib_toolbar.addWidget(bounds_label_xmax)
+        self._calib_toolbar.addWidget(self._bev_xmax_spinbox)
+        self._calib_toolbar.addWidget(bounds_label_ymax)
+        self._calib_toolbar.addWidget(self._bev_ymax_spinbox)
+        self._calib_toolbar.addSeparator()
+        self._calib_toolbar.addWidget(apply_calib_btn)
+        
+        self.addToolBar(Qt.TopToolBarArea, self._calib_toolbar)
 
         self.status_left = QtWidgets.QLabel(self.tr("%s started.") % __appname__)
         self.status_right = StatusStats()
@@ -1595,85 +1682,90 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         
         success = True
-        for idx, cam_data in enumerate(self.multi_camera_data):
-            image_path = cam_data["image_path"]
-            label_file = f"{osp.splitext(image_path)[0]}.json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            
-            # Get shapes for this camera
-            cell = self.multi_camera_canvas.camera_cells[idx]
-            shapes = cell.shapes
-            
-            # Format shapes
-            def format_shape(s):
-                data = s.other_data.copy() if hasattr(s, 'other_data') else {}
-                data.update(
-                    dict(
-                        label=s.label,
-                        points=[(p.x(), p.y()) for p in s.points],
-                        group_id=s.group_id,
-                        description=s.description,
-                        shape_type=s.shape_type,
-                        flags=s.flags if hasattr(s, 'flags') else {},
-                        mask=None
-                        if not hasattr(s, 'mask') or s.mask is None
-                        else utils.img_arr_to_b64(s.mask.astype(np.uint8)),
-                    )
-                )
-                return data
-            
-            formatted_shapes = [format_shape(s) for s in shapes]
-            
-            # Load image data
-            image_data = LabelFile.load_image_file(image_path)
-            if not image_data:
-                logger.warning(f"Failed to load image: {image_path}")
-                success = False
-                continue
-            
-            image = QtGui.QImage.fromData(image_data)
-            if image.isNull():
-                logger.warning(f"Failed to decode image: {image_path}")
-                success = False
-                continue
-            
-            # Save label file
-            lf = LabelFile()
-            try:
-                if osp.dirname(label_file) and not osp.exists(osp.dirname(label_file)):
-                    os.makedirs(osp.dirname(label_file))
-                
-                imagePath = osp.relpath(image_path, osp.dirname(label_file))
-                # imageData = image_data if self._config["store_data"] else None
-                
-                flags = {}
-                for i in range(self.flag_widget.count()):  # type: ignore[union-attr]
-                    item = self.flag_widget.item(i)  # type: ignore[union-attr]
-                    assert item
-                    key = item.text()
-                    flag = item.checkState() == Qt.Checked
-                    flags[key] = flag
-                
-                lf.save(
-                    filename=label_file,
-                    shapes=formatted_shapes,
-                    imagePath=imagePath,
-                    imageData=None,  # imageData disabled
-                    imageHeight=image.height(),
-                    imageWidth=image.width(),
-                    otherData=self._other_data,
-                    flags=flags,
-                )
-                logger.info(f"Saved labels for camera {cam_data['camera_id']}: {label_file}")
-            except LabelFileError as e:
-                logger.error(f"Error saving label file {label_file}: {e}")
-                success = False
         
-        # Save global annotation format
-        if success:
-            self._save_global_annotations()
+        # For AICV structure, only save to annotations_positions (skip individual camera JSON files)
+        is_aicv = hasattr(self, "_aicv_root_dir") and self._aicv_root_dir is not None
+        
+        if not is_aicv:
+            # Legacy mode: save individual camera JSON files
+            for idx, cam_data in enumerate(self.multi_camera_data):
+                image_path = cam_data["image_path"]
+                label_file = f"{osp.splitext(image_path)[0]}.json"
+                if self.output_dir:
+                    label_file_without_path = osp.basename(label_file)
+                    label_file = osp.join(self.output_dir, label_file_without_path)
+                
+                # Get shapes for this camera
+                cell = self.multi_camera_canvas.camera_cells[idx]
+                shapes = cell.shapes
+                
+                # Format shapes
+                def format_shape(s):
+                    data = s.other_data.copy() if hasattr(s, 'other_data') else {}
+                    data.update(
+                        dict(
+                            label=s.label,
+                            points=[(p.x(), p.y()) for p in s.points],
+                            group_id=s.group_id,
+                            description=s.description,
+                            shape_type=s.shape_type,
+                            flags=s.flags if hasattr(s, 'flags') else {},
+                            mask=None
+                            if not hasattr(s, 'mask') or s.mask is None
+                            else utils.img_arr_to_b64(s.mask.astype(np.uint8)),
+                        )
+                    )
+                    return data
+                
+                formatted_shapes = [format_shape(s) for s in shapes]
+                
+                # Load image data
+                image_data = LabelFile.load_image_file(image_path)
+                if not image_data:
+                    logger.warning(f"Failed to load image: {image_path}")
+                    success = False
+                    continue
+                
+                image = QtGui.QImage.fromData(image_data)
+                if image.isNull():
+                    logger.warning(f"Failed to decode image: {image_path}")
+                    success = False
+                    continue
+                
+                # Save label file
+                lf = LabelFile()
+                try:
+                    if osp.dirname(label_file) and not osp.exists(osp.dirname(label_file)):
+                        os.makedirs(osp.dirname(label_file))
+                    
+                    imagePath = osp.relpath(image_path, osp.dirname(label_file))
+                    # imageData = image_data if self._config["store_data"] else None
+                    
+                    flags = {}
+                    for i in range(self.flag_widget.count()):  # type: ignore[union-attr]
+                        item = self.flag_widget.item(i)  # type: ignore[union-attr]
+                        assert item
+                        key = item.text()
+                        flag = item.checkState() == Qt.Checked
+                        flags[key] = flag
+                    
+                    lf.save(
+                        filename=label_file,
+                        shapes=formatted_shapes,
+                        imagePath=imagePath,
+                        imageData=None,  # imageData disabled
+                        imageHeight=image.height(),
+                        imageWidth=image.width(),
+                        otherData=self._other_data,
+                        flags=flags,
+                    )
+                    logger.info(f"Saved labels for camera {cam_data['camera_id']}: {label_file}")
+                except LabelFileError as e:
+                    logger.error(f"Error saving label file {label_file}: {e}")
+                    success = False
+        
+        # Save global annotation format (always save for both AICV and legacy modes)
+        self._save_global_annotations()
         
         return success
 
@@ -1750,15 +1842,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.multi_camera_canvas or not self.bev_canvas:
             return
         
-        # Delete from BEV canvas
-        boxes_to_remove = []
-        for idx, (center, size, rotation, label, box_group_id) in enumerate(self.bev_canvas.boxes_3d):
-            if box_group_id == group_id:
-                boxes_to_remove.append(idx)
-        
-        # Remove boxes in reverse order to maintain indices
-        for idx in reversed(boxes_to_remove):
-            del self.bev_canvas.boxes_3d[idx]
+        # Delete point from BEV canvas
+        self.bev_canvas.deletePointByGroupId(group_id)
         
         # Delete from all cameras
         for idx, cell in enumerate(self.multi_camera_canvas.camera_cells):
@@ -1783,15 +1868,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """Update the ground point list widget"""
         self.ground_point_widget.clear()
         
-        if not self.bev_canvas or not self.bev_canvas.boxes_3d:
+        if not self.bev_canvas or not self.bev_canvas.points:
             return
         
-        for center, size, rotation, label, group_id in self.bev_canvas.boxes_3d:
+        for mem_x, mem_y, label, group_id in self.bev_canvas.points:
             if group_id is None:
                 continue
             
-            # Format: "ID 1: (10.5, 15.2) - person"
-            text = f"ID {group_id}: ({center[0]:.1f}, {center[1]:.1f}m) - {label}"
+            # Convert back to grid coordinates for display
+            grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
+            
+            # Format: "ID 1: grid(137, 37) - object"
+            text = f"ID {group_id}: grid({grid_x}, {grid_y}) - {label}"
             item = QtWidgets.QListWidgetItem(text)
             item.setData(Qt.UserRole, group_id)
             self.ground_point_widget.addItem(item)
@@ -1800,9 +1888,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """Get next unique group_id"""
         max_id = 0
         
-        # Check BEV boxes
-        if self.bev_canvas and self.bev_canvas.boxes_3d:
-            for _, _, _, _, group_id in self.bev_canvas.boxes_3d:
+        # Check BEV points
+        if self.bev_canvas and self.bev_canvas.points:
+            for _, _, _, group_id in self.bev_canvas.points:
                 if group_id is not None and group_id > max_id:
                     max_id = group_id
         
@@ -1815,32 +1903,230 @@ class MainWindow(QtWidgets.QMainWindow):
         
         return max_id + 1
 
+    def _worldgrid_to_mem(self, grid_x: float, grid_y: float) -> tuple[float, float]:
+        """
+        Transform world grid coordinates to memory coordinates for BEV display.
+        
+        Uses the same transformation as generate_bev_overlay.py:
+        1. Apply worldgrid2worldcoord (rotation + translation + scale)
+        2. Apply mem_T_ref to convert world coords to memory coords
+        
+        Args:
+            grid_x, grid_y: World grid coordinates from ground_points
+            
+        Returns:
+            (mem_x, mem_y): Memory coordinates for BEV display
+        """
+        # Transformation parameters (same as generate_bev_overlay.py)
+        world_x = grid_x
+        world_y = grid_y
+        
+        # Use configurable BEV grid parameters
+        bev_x, bev_y = self._bev_x, self._bev_y
+        XMIN, XMAX = self._bev_bounds[0], self._bev_bounds[1]
+        YMIN, YMAX = self._bev_bounds[2], self._bev_bounds[3]
+        
+        # Voxel sizes
+        vox_size_X = (XMAX - XMIN) / float(bev_x)
+        vox_size_Y = (YMAX - YMIN) / float(bev_y)
+        
+        # Apply mem_T_ref transformation (world -> memory)
+        # Translation: shift by -MIN and -vox_size/2
+        # Scaling: divide by vox_size
+        mem_x = (world_x - XMIN - vox_size_X / 2.0) / vox_size_X
+        mem_y = (world_y - YMIN - vox_size_Y / 2.0) / vox_size_Y
+        
+        return mem_x, mem_y
+
+    def _mem_to_worldgrid(self, mem_x: float, mem_y: float) -> tuple[int, int]:
+        """
+        Transform memory coordinates back to world grid coordinates.
+        Inverse of _worldgrid_to_mem.
+        
+        Args:
+            mem_x, mem_y: Memory coordinates from BEV display
+            
+        Returns:
+            (grid_x, grid_y): World grid coordinates for ground_points
+        """
+        # Use configurable BEV grid parameters
+        bev_x, bev_y = self._bev_x, self._bev_y
+        XMIN, XMAX = self._bev_bounds[0], self._bev_bounds[1]
+        YMIN, YMAX = self._bev_bounds[2], self._bev_bounds[3]
+        
+        # Voxel sizes
+        vox_size_X = (XMAX - XMIN) / float(bev_x)
+        vox_size_Y = (YMAX - YMIN) / float(bev_y)
+        
+        # Inverse of mem_T_ref: memory -> world
+        world_x = mem_x * vox_size_X + XMIN + vox_size_X / 2.0
+        world_y = mem_y * vox_size_Y + YMIN + vox_size_Y / 2.0
+        
+        # Transformation parameters
+        theta = -3
+        theta_rad = theta / 180.0 * np.pi
+        cos_t = np.cos(theta_rad)
+        sin_t = np.sin(theta_rad)
+        scale = 0.5
+        tx, ty = -74, -54
+        
+        # Inverse of worldgrid2worldcoord: world -> grid
+        # First subtract translation
+        wx = world_x - tx
+        wy = world_y - ty
+        
+        # Inverse of rotation and scale matrix
+        # Original: [[s*cos, -s*sin], [s*sin, s*cos]]
+        # Inverse: (1/s) * [[cos, sin], [-sin, cos]]
+        inv_scale = 1.0 / scale
+        grid_x = inv_scale * (cos_t * wx + sin_t * wy)
+        grid_y = inv_scale * (-sin_t * wx + cos_t * wy)
+        
+        return int(round(grid_x)), int(round(grid_y))
+
+    def _load_global_annotations(self, frame_index: int) -> None:
+        """Load global annotations from annotations_positions folder"""
+        if not self.multi_camera_canvas or not self.multi_camera_data:
+            return
+        
+        # Find annotation file
+        root_dir = None
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        
+        if not root_dir:
+            return
+        
+        # Try different frame_id formats (5-digit is most common)
+        annotation_file = None
+        for fmt in [f"{frame_index:05d}.json", f"{frame_index:08d}.json", f"{frame_index:04d}.json", f"{frame_index}.json"]:
+            path = osp.join(root_dir, "annotations_positions", fmt)
+            if osp.exists(path):
+                annotation_file = path
+                break
+        
+        if not annotation_file:
+            logger.info(f"No annotation file found for frame {frame_index}")
+            return
+        
+        try:
+            with open(annotation_file, 'r') as f:
+                annotations = json.load(f)
+            
+            logger.info(f"Loading {len(annotations)} annotations from {annotation_file}")
+            
+            for person in annotations:
+                person_id = person.get("personID")
+                # Prioritize 'ground_points' (grid coordinates) over 'coordinates' (world coordinates)
+                ground_points = person.get("ground_points")
+                views = person.get("views", [])
+                
+                if person_id is None:
+                    continue
+                
+                # Add point on BEV map if ground_points are valid
+                if self.bev_canvas and ground_points and len(ground_points) >= 2:
+                    # ground_points are world grid coordinates (grid_x, grid_y)
+                    grid_x = ground_points[0]
+                    grid_y = ground_points[1]
+                    
+                    # Check if ground_points are valid (positive values)
+                    if grid_x >= 0 and grid_y >= 0:
+                        # Transform to memory coordinates for BEV display
+                        mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                        
+                        # Add point to BEV canvas (not a box)
+                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                # Add bounding boxes to camera views
+                for view in views:
+                    view_num = view.get("viewNum", -1)
+                    xmin = view.get("xmin", -1)
+                    ymin = view.get("ymin", -1)
+                    xmax = view.get("xmax", -1)
+                    ymax = view.get("ymax", -1)
+                    
+                    # Skip invalid boxes
+                    if xmin < 0 or ymin < 0 or xmax < 0 or ymax < 0:
+                        continue
+                    
+                    # viewNum is 1-indexed in AICV format, convert to 0-indexed
+                    camera_idx = view_num - 1
+                    
+                    if camera_idx < 0 or camera_idx >= len(self.multi_camera_canvas.camera_cells):
+                        continue
+                    
+                    # Create rectangle shape for this camera view
+                    shape = Shape(
+                        label="object",
+                        shape_type="rectangle",
+                        group_id=person_id,
+                    )
+                    shape.addPoint(QtCore.QPointF(xmin, ymin))
+                    shape.addPoint(QtCore.QPointF(xmax, ymax))
+                    shape.close()
+                    
+                    # Update shape color based on group_id
+                    self._update_shape_color(shape)
+                    
+                    # Add to the corresponding camera cell
+                    cell = self.multi_camera_canvas.camera_cells[camera_idx]
+                    cell.shapes.append(shape)
+                    self.multi_camera_canvas.camera_cells[camera_idx] = cell
+                    
+                    # Add to label list
+                    self.addLabel(shape)
+            
+            
+            # Update BEV canvas
+            if self.bev_canvas:
+                self.bev_canvas.update()
+            
+            logger.info(f"Loaded annotations for frame {frame_index}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load annotations from {annotation_file}: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _save_global_annotations(self) -> None:
-        """Save global annotations in annotation_position folder"""
+        """Save global annotations in annotations_positions folder"""
         if not self.multi_camera_canvas or not self.multi_camera_data or not self.filename:
             return
         
-        # Extract frame index from filename (e.g., "Frame_0001" -> "00000001")
+        # Extract frame index from filename (e.g., "Frame_0001" -> "00001")
         try:
             if self.filename.startswith("Frame_"):
                 frame_index = int(self.filename.split("_")[1])
-                frame_id = f"{frame_index:08d}"
+                frame_id = f"{frame_index:05d}"  # 5-digit format to match AICV
             else:
-                frame_id = "00000000"
+                frame_id = "00000"
         except (ValueError, IndexError):
             logger.warning(f"Could not parse frame index from {self.filename}")
             return
         
-        # Find the root directory (parent of Image_subsets)
-        if hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+        # Find the root directory
+        # For AICV structure: _aicv_root_dir is the root that contains Image_subsets and calibrations
+        # For legacy structure: _prev_opened_dir is the parent that contains camera folders
+        root_dir = None
+        
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            # AICV structure: root_dir is the AICV root (contains Image_subsets, calibrations)
+            root_dir = self._aicv_root_dir
+        elif hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+            # Legacy: _multi_camera_root_dirs[0] = /wildtrack/Camera1
+            # Go up to get the root
             root_dir = osp.dirname(self._multi_camera_root_dirs[0])
         elif self._prev_opened_dir:
+            # _prev_opened_dir is the multi-camera root
             root_dir = self._prev_opened_dir
-        else:
+        
+        if not root_dir:
             return
         
-        # Create annotation_position folder
-        annotation_dir = osp.join(root_dir, "annotation_position")
+        # Create annotations_positions folder at same level as Image_subsets
+        annotation_dir = osp.join(root_dir, "annotations_positions")
         if not osp.exists(annotation_dir):
             os.makedirs(annotation_dir)
         
@@ -1860,11 +2146,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if person_id not in persons:
                     persons[person_id] = {
                         "personID": person_id,
-                        "ground_points": [-1, -1],  # Will be updated from BEV if available
+                        "ground_points": [-1, -1],  # Will be updated from BEV if available (grid coordinates)
                         "views": []
                     }
-                    # Initialize all views with -1
-                    for view_num in range(len(self.multi_camera_data)):
+                    # Initialize all views with -1 (viewNum is 1-indexed to match AICV format)
+                    for view_num in range(1, len(self.multi_camera_data) + 1):
                         persons[person_id]["views"].append({
                             "viewNum": view_num,
                             "xmin": -1,
@@ -1882,24 +2168,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     xmax = int(max(x_coords))
                     ymax = int(max(y_coords))
                     
-                    # Update the view for this camera
+                    # Update the view for this camera (viewNum is 1-indexed)
                     persons[person_id]["views"][camera_idx] = {
-                        "viewNum": camera_idx,
+                        "viewNum": camera_idx + 1,  # 1-indexed
                         "xmin": xmin,
                         "ymin": ymin,
                         "xmax": xmax,
                         "ymax": ymax
                     }
         
-        # Update ground_points from BEV 3D boxes if available
-        if self.bev_canvas and self.bev_canvas.boxes_3d:
-            for center, size, rotation, label, group_id in self.bev_canvas.boxes_3d:
+        # Update ground_points from BEV points if available
+        # BEV points are in memory coordinates, need to convert back to world grid
+        if self.bev_canvas and self.bev_canvas.points:
+            for mem_x, mem_y, label, group_id in self.bev_canvas.points:
                 if group_id in persons:
-                    # Use center x, y as ground points (in centimeters)
-                    persons[group_id]["ground_points"] = [
-                        int(center[0] * 100),  # Convert meters to centimeters
-                        int(center[1] * 100)
-                    ]
+                    # Convert memory coordinates back to world grid coordinates
+                    grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
+                    persons[group_id]["ground_points"] = [grid_x, grid_y]
         
         # Convert to list format
         annotations = list(persons.values())
@@ -2780,9 +3065,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filename = None
         self.fileListWidget.clear()
 
-        # Check if this is a multi-camera directory
-        if _detect_multi_camera_structure(root_dir):
+        # Check if this is a multi-camera directory (legacy or AICV structure)
+        if _detect_aicv_structure(root_dir):
+            # AICV structure: Image_subsets + calibrations
             self.is_multi_camera_mode = True
+            self._aicv_root_dir = root_dir  # Store AICV root for calibration lookup
+            
+            image_subsets_dir = osp.join(root_dir, "Image_subsets")
+            subdirs = sorted([d for d in os.listdir(image_subsets_dir) if osp.isdir(osp.join(image_subsets_dir, d))])
+            max_frames = 0
+            extensions = [
+                f".{fmt.data().decode().lower()}"
+                for fmt in QtGui.QImageReader.supportedImageFormats()
+            ]
+            for subdir in subdirs:
+                folder_path = osp.join(image_subsets_dir, subdir)
+                frame_files = [
+                    f for f in os.listdir(folder_path)
+                    if f.lower().endswith(tuple(extensions))
+                ]
+                max_frames = max(max_frames, len(frame_files))
+            
+            # Add frame indices to file list
+            for frame_idx in range(max_frames):
+                frame_label = f"Frame_{frame_idx:04d}"
+                item = QtWidgets.QListWidgetItem(frame_label)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                # Check if annotation exists in annotations_positions (try different formats)
+                annotation_exists = False
+                for fmt in [f"{frame_idx:05d}.json", f"{frame_idx:04d}.json", f"{frame_idx:08d}.json"]:
+                    test_path = osp.join(root_dir, "annotations_positions", fmt)
+                    if osp.exists(test_path):
+                        annotation_exists = True
+                        break
+                item.setCheckState(Qt.Checked if annotation_exists else Qt.Unchecked)
+                self.fileListWidget.addItem(item)
+        elif _detect_multi_camera_structure(root_dir):
+            # Legacy multi-camera structure with frames/calibrations per camera
+            self.is_multi_camera_mode = True
+            self._aicv_root_dir = None
             # For multi-camera, we list frame indices instead of individual files
             # Find max number of frames
             subdirs = sorted([d for d in os.listdir(root_dir) if osp.isdir(osp.join(root_dir, d))])
@@ -2892,10 +3213,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         intrinsic_path = osp.join(intrinsic_original_dir, intrinsic_files[0])
                         extrinsic_path = osp.join(extrinsic_dir, extrinsic_files[0])
                         
-                        calibration = CameraCalibration.load_from_xml_files(intrinsic_path, extrinsic_path)
+                        # Load calibration with default scale factors
+                        calibration = CameraCalibration.load_from_xml_files_scaled(
+                            intrinsic_path, 
+                            extrinsic_path,
+                            intrinsic_scale=self._intrinsic_scale_factor,
+                            translation_scale=self._translation_scale_factor
+                        )
                         if calibration:
                             self.camera_calibrations[camera_id] = calibration
-                            logger.info(f"Loaded calibration for camera {camera_id}")
+                            logger.info(f"Loaded calibration for camera {camera_id} (K×{self._intrinsic_scale_factor}, T×{self._translation_scale_factor})")
                         else:
                             logger.warning(f"Failed to load calibration for camera {camera_id}")
                     else:
@@ -2951,51 +3278,61 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 logger.warning(f"Failed to update BEV overlay image: {e}")
         
-        # Clear BEV boxes when loading new frame
+        # Clear BEV boxes and points when loading new frame
         if self.bev_canvas:
             self.bev_canvas.clearBoxes()
+            self.bev_canvas.clearPoints()
         
-        # Load labels for each camera
+        # Load labels
         self.labelList.clear()
-        for idx, cam_data in enumerate(camera_data):
-            image_path = cam_data["image_path"]
-            label_file = f"{osp.splitext(image_path)[0]}.json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            
-            if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
-                try:
-                    label_file_obj = LabelFile(label_file)
-                    shapes = []
-                    for shape_dict in label_file_obj.shapes:
-                        shape = Shape(
-                            label=shape_dict["label"],
-                            shape_type=shape_dict["shape_type"],
-                            group_id=shape_dict.get("group_id"),
-                            description=shape_dict.get("description"),
-                        )
-                        for x, y in shape_dict["points"]:
-                            shape.addPoint(QtCore.QPointF(x, y))
-                        shape.close()
-                        # Preserve from_bev flag if it exists
-                        if "other_data" in shape_dict and "from_bev" in shape_dict["other_data"]:
-                            shape.other_data["from_bev"] = shape_dict["other_data"]["from_bev"]
-                        shapes.append(shape)
-                    
-                    # Load shapes into the corresponding cell ONLY
-                    if idx < len(self.multi_camera_canvas.camera_cells):
-                        cell = self.multi_camera_canvas.camera_cells[idx]
-                        # Add shapes to this specific cell
-                        for shape in shapes:
-                            cell.shapes.append(shape)
-                        self.multi_camera_canvas.camera_cells[idx] = cell
+        
+        # For AICV structure, load from annotations_positions folder
+        is_aicv = hasattr(self, "_aicv_root_dir") and self._aicv_root_dir is not None
+        
+        if is_aicv:
+            # Load global annotations from annotations_positions
+            self._load_global_annotations(frame_index)
+        else:
+            # Legacy: load per-camera JSON files
+            for idx, cam_data in enumerate(camera_data):
+                image_path = cam_data["image_path"]
+                label_file = f"{osp.splitext(image_path)[0]}.json"
+                if self.output_dir:
+                    label_file_without_path = osp.basename(label_file)
+                    label_file = osp.join(self.output_dir, label_file_without_path)
+                
+                if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
+                    try:
+                        label_file_obj = LabelFile(label_file)
+                        shapes = []
+                        for shape_dict in label_file_obj.shapes:
+                            shape = Shape(
+                                label=shape_dict["label"],
+                                shape_type=shape_dict["shape_type"],
+                                group_id=shape_dict.get("group_id"),
+                                description=shape_dict.get("description"),
+                            )
+                            for x, y in shape_dict["points"]:
+                                shape.addPoint(QtCore.QPointF(x, y))
+                            shape.close()
+                            # Preserve from_bev flag if it exists
+                            if "other_data" in shape_dict and "from_bev" in shape_dict["other_data"]:
+                                shape.other_data["from_bev"] = shape_dict["other_data"]["from_bev"]
+                            shapes.append(shape)
                         
-                        # Add shapes to label list
-                        for shape in shapes:
-                            self.addLabel(shape)
-                except LabelFileError as e:
-                    logger.warning(f"Failed to load label file {label_file}: {e}")
+                        # Load shapes into the corresponding cell ONLY
+                        if idx < len(self.multi_camera_canvas.camera_cells):
+                            cell = self.multi_camera_canvas.camera_cells[idx]
+                            # Add shapes to this specific cell
+                            for shape in shapes:
+                                cell.shapes.append(shape)
+                            self.multi_camera_canvas.camera_cells[idx] = cell
+                            
+                            # Add shapes to label list
+                            for shape in shapes:
+                                self.addLabel(shape)
+                    except LabelFileError as e:
+                        logger.warning(f"Failed to load label file {label_file}: {e}")
         
         self.multi_camera_canvas.update()
         self._update_ground_point_list()
@@ -3069,6 +3406,111 @@ class MainWindow(QtWidgets.QMainWindow):
         scale = min(400.0 / max(width, height) * 0.8, 100.0)  # Limit max scale
         
         return width, height, scale
+    
+    def _apply_calibration_scales(self) -> None:
+        """Apply calibration scale factors and regenerate BEV"""
+        if not self.is_multi_camera_mode or not self.multi_camera_data:
+            logger.warning("No multi-camera data loaded")
+            return
+        
+        # Read values from spinboxes
+        self._intrinsic_scale_factor = self._intrinsic_scale_spinbox.value()
+        self._translation_scale_factor = self._translation_scale_spinbox.value()
+        self._bev_x = self._bev_x_spinbox.value()
+        self._bev_y = self._bev_y_spinbox.value()
+        self._bev_bounds[1] = self._bev_xmax_spinbox.value()  # XMAX
+        self._bev_bounds[3] = self._bev_ymax_spinbox.value()  # YMAX
+        
+        logger.info(f"Applying settings: K={self._intrinsic_scale_factor}, T={self._translation_scale_factor}, "
+                    f"BEV X={self._bev_x}, Y={self._bev_y}, XMAX={self._bev_bounds[1]}, YMAX={self._bev_bounds[3]}")
+        
+        # Reload calibrations with new scale factors
+        self._reload_calibrations_with_scales()
+        
+        # Regenerate BEV
+        if self.bev_canvas and self.camera_calibrations:
+            self._regenerate_bev()
+        
+        self.show_status_message(f"Applied: K={self._intrinsic_scale_factor}, T={self._translation_scale_factor}, "
+                                  f"Grid={self._bev_x}x{self._bev_y}, Bounds=[{self._bev_bounds[1]},{self._bev_bounds[3]}]")
+    
+    def _reload_calibrations_with_scales(self) -> None:
+        """Reload calibrations with current scale factors"""
+        if not self.multi_camera_data:
+            return
+        
+        from labelme.utils.calibration import CameraCalibration
+        
+        for cam_data in self.multi_camera_data:
+            camera_id = cam_data["camera_id"]
+            calibration_path = cam_data.get("calibration_path")
+            
+            if not calibration_path or not osp.isdir(calibration_path):
+                continue
+            
+            # Look for intrinsic and extrinsic XML files
+            intrinsic_original_dir = osp.join(calibration_path, "intrinsic_original")
+            extrinsic_dir = osp.join(calibration_path, "extrinsic")
+            
+            if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir):
+                intrinsic_files = [f for f in os.listdir(intrinsic_original_dir) if f.endswith('.xml')]
+                extrinsic_files = [f for f in os.listdir(extrinsic_dir) if f.endswith('.xml')]
+                
+                if intrinsic_files and extrinsic_files:
+                    intrinsic_path = osp.join(intrinsic_original_dir, intrinsic_files[0])
+                    extrinsic_path = osp.join(extrinsic_dir, extrinsic_files[0])
+                    
+                    # Load calibration with scale factors
+                    calibration = CameraCalibration.load_from_xml_files_scaled(
+                        intrinsic_path, 
+                        extrinsic_path,
+                        intrinsic_scale=self._intrinsic_scale_factor,
+                        translation_scale=self._translation_scale_factor
+                    )
+                    if calibration:
+                        self.camera_calibrations[camera_id] = calibration
+                        logger.info(f"Reloaded calibration for {camera_id} with scales")
+    
+    def _regenerate_bev(self) -> None:
+        """Regenerate BEV background image with current calibrations"""
+        if not self.bev_canvas or not self.camera_calibrations or not self.multi_camera_data:
+            return
+        
+        try:
+            # Use configurable BEV parameters
+            bev_width = float(self._bev_bounds[1])  # XMAX
+            bev_height = float(self._bev_bounds[3])  # YMAX
+            bev_scale = max(bev_width, bev_height) / 512.0
+            
+            # Update BEV canvas parameters
+            self.bev_canvas.setBEVParams(width=bev_width, height=bev_height, scale=bev_scale)
+            self.bev_canvas.setCameraOverlay(self.camera_calibrations, self.multi_camera_data)
+            
+            logger.info(f"Regenerating BEV overlay with grid={self._bev_x}x{self._bev_y}, bounds=[{self._bev_bounds[1]},{self._bev_bounds[3]}]...")
+            bev_image = generate_bev_from_cameras(
+                self.camera_calibrations,
+                self.multi_camera_data,
+                bev_width,
+                bev_height,
+                resolution=bev_scale,
+            )
+            if bev_image is not None:
+                h, w, _ = bev_image.shape
+                qimg = QtGui.QImage(
+                    bev_image.data,
+                    w,
+                    h,
+                    3 * w,
+                    QtGui.QImage.Format_RGB888,
+                ).copy()
+                self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
+                logger.info("✅ BEV overlay regenerated successfully")
+            else:
+                logger.warning("BEV generation returned None")
+        except Exception as e:
+            logger.error(f"Failed to regenerate BEV: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _setup_bev_canvas(self):
         """Setup BEV canvas for 3D box placement"""
@@ -3459,6 +3901,52 @@ def _detect_multi_camera_structure(root_dir: str) -> bool:
     return has_frames
 
 
+def _detect_aicv_structure(root_dir: str) -> bool:
+    """Detect if directory has AICV folder structure (Image_subsets + calibrations)"""
+    if not osp.isdir(root_dir):
+        return False
+    
+    # Check for Image_subsets folder
+    image_subsets_dir = osp.join(root_dir, "Image_subsets")
+    if not osp.isdir(image_subsets_dir):
+        return False
+    
+    # Check for calibrations folder
+    calibrations_dir = osp.join(root_dir, "calibrations")
+    if not osp.isdir(calibrations_dir):
+        return False
+    
+    # Check if Image_subsets has numbered subfolders with images
+    subdirs = [d for d in os.listdir(image_subsets_dir) if osp.isdir(osp.join(image_subsets_dir, d))]
+    if len(subdirs) < 1:
+        return False
+    
+    return True
+
+
+def _get_aicv_camera_mapping(calibrations_dir: str) -> dict:
+    """
+    Get mapping from folder number to camera name for AICV structure.
+    Returns: dict mapping '1' -> 'Camera1', '2' -> 'Camera2', etc.
+    """
+    mapping = {}
+    if not osp.isdir(calibrations_dir):
+        return mapping
+    
+    for camera_name in sorted(os.listdir(calibrations_dir)):
+        camera_path = osp.join(calibrations_dir, camera_name)
+        if not osp.isdir(camera_path):
+            continue
+        # Extract number from camera name (e.g., Camera1 -> 1)
+        import re
+        match = re.search(r'(\d+)', camera_name)
+        if match:
+            folder_num = match.group(1)
+            mapping[folder_num] = camera_name
+    
+    return mapping
+
+
 def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
     """
     Scan multi-camera directory structure and return camera data for a specific frame.
@@ -3468,6 +3956,7 @@ def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
     root_dirs:
         - Trường hợp cũ: một folder lớn, trong đó mỗi subfolder là một camera.
         - Trường hợp mới: list các folder camera cụ thể (mỗi phần tử là path tới 1 camera).
+        - Trường hợp AICV: folder có cấu trúc Image_subsets + calibrations.
     """
     camera_data = []
     
@@ -3475,6 +3964,10 @@ def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
         f".{fmt.data().decode().lower()}"
         for fmt in QtGui.QImageReader.supportedImageFormats()
     ]
+    
+    # Check for AICV structure first
+    if isinstance(root_dirs, str) and _detect_aicv_structure(root_dirs):
+        return _scan_aicv_camera_data(root_dirs, frame_index)
     
     # Resolve camera directories list
     if isinstance(root_dirs, (list, tuple)):
@@ -3510,6 +4003,68 @@ def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
             image_path = frame_files[frame_index]
             # Calibration path is the calibrations directory itself
             calibration_path = calibrations_dir if osp.isdir(calibrations_dir) else None
+            
+            camera_data.append({
+                "camera_id": camera_id,
+                "image_path": image_path,
+                "calibration_path": calibration_path,
+            })
+    
+    return camera_data
+
+
+def _scan_aicv_camera_data(root_dir: str, frame_index: int = 0) -> list[dict]:
+    """
+    Scan AICV folder structure and return camera data for a specific frame.
+    
+    Structure:
+        root_dir/
+            Image_subsets/
+                1/  (images for camera 1)
+                2/  (images for camera 2)
+                ...
+            calibrations/
+                Camera1/calibrations/
+                Camera2/calibrations/
+                ...
+    """
+    camera_data = []
+    
+    extensions = [
+        f".{fmt.data().decode().lower()}"
+        for fmt in QtGui.QImageReader.supportedImageFormats()
+    ]
+    
+    image_subsets_dir = osp.join(root_dir, "Image_subsets")
+    calibrations_dir = osp.join(root_dir, "calibrations")
+    
+    # Get camera mapping (folder number -> camera name)
+    camera_mapping = _get_aicv_camera_mapping(calibrations_dir)
+    
+    # Scan numbered folders in Image_subsets
+    subdirs = sorted([d for d in os.listdir(image_subsets_dir) if osp.isdir(osp.join(image_subsets_dir, d))])
+    
+    for folder_num in subdirs:
+        folder_path = osp.join(image_subsets_dir, folder_num)
+        
+        # Find all images in this folder (directly, not in frames subfolder)
+        frame_files = []
+        for file in os.listdir(folder_path):
+            if file.lower().endswith(tuple(extensions)):
+                frame_files.append(osp.join(folder_path, file))
+        
+        frame_files = natsort.os_sorted(frame_files)
+        
+        if frame_index < len(frame_files):
+            image_path = frame_files[frame_index]
+            
+            # Get camera name from mapping or create one
+            camera_name = camera_mapping.get(folder_num, f"Camera{folder_num}")
+            camera_id = f"Camera{folder_num}"
+            
+            # Calibration path points to centralized calibrations folder
+            camera_calib_path = osp.join(calibrations_dir, camera_name, "calibrations")
+            calibration_path = camera_calib_path if osp.isdir(camera_calib_path) else None
             
             camera_data.append({
                 "camera_id": camera_id,

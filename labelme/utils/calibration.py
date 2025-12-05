@@ -58,6 +58,68 @@ class CameraCalibration:
             logger.error(f"Failed to load calibration from XML files: {e}")
             return None
     
+    @classmethod
+    def load_from_xml_files_scaled(
+        cls, 
+        intrinsic_path: str, 
+        extrinsic_path: str,
+        intrinsic_scale: float = 1.0,
+        translation_scale: float = 1.0
+    ) -> Optional['CameraCalibration']:
+        """
+        Load calibration from OpenCV XML files with scaling applied.
+        
+        Args:
+            intrinsic_path: Path to intrinsic XML file
+            extrinsic_path: Path to extrinsic XML file
+            intrinsic_scale: Scale factor for intrinsic matrix (fx, fy, cx, cy)
+            translation_scale: Scale factor for translation vector in extrinsic
+            
+        Returns:
+            CameraCalibration with scaled parameters
+        """
+        try:
+            # Load intrinsic
+            intrinsic = cls._load_intrinsic_xml(intrinsic_path)
+            if intrinsic is None:
+                return None
+            
+            # Load extrinsic
+            extrinsic = cls._load_extrinsic_xml(extrinsic_path)
+            if extrinsic is None:
+                return None
+            
+            # Load distortion (from intrinsic file)
+            distortion = cls._load_distortion_xml(intrinsic_path)
+            
+            # Apply intrinsic scale
+            scaled_intrinsic = cls._scale_intrinsic(intrinsic, intrinsic_scale)
+            
+            # Apply translation scale
+            scaled_extrinsic = cls._scale_extrinsic_translation(extrinsic, translation_scale)
+            
+            return cls(scaled_intrinsic, scaled_extrinsic, distortion)
+        except Exception as e:
+            logger.error(f"Failed to load scaled calibration from XML files: {e}")
+            return None
+    
+    @staticmethod
+    def _scale_intrinsic(K: np.ndarray, scale: float) -> np.ndarray:
+        """Scale intrinsic matrix by given factor"""
+        K_scaled = K.copy()
+        K_scaled[0, 0] *= scale  # fx
+        K_scaled[1, 1] *= scale  # fy
+        K_scaled[0, 2] *= scale  # cx
+        K_scaled[1, 2] *= scale  # cy
+        return K_scaled
+    
+    @staticmethod
+    def _scale_extrinsic_translation(extrinsic: np.ndarray, scale: float) -> np.ndarray:
+        """Scale translation vector in extrinsic matrix"""
+        scaled = extrinsic.copy()
+        scaled[:3, 3] *= scale  # Scale translation vector
+        return scaled
+    
     @staticmethod
     def _load_intrinsic_xml(filepath: str) -> Optional[np.ndarray]:
         """Load intrinsic matrix from OpenCV XML file"""
