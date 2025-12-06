@@ -10,7 +10,7 @@ class Box3DDialog(QtWidgets.QDialog):
     """Dialog for entering 3D box parameters"""
     
     def __init__(self, parent=None, x: float = 0.0, y: float = 0.0, z: float = 0.0,
-                 w: float = 50.0, h: float = 160.0, d: float = 50.0,
+                 w: float = 50.0, h: float = 50.0, d: float = 50.0,
                  label: str = "object", group_id: Optional[int] = None):
         super().__init__(parent)
         self.setWindowTitle("3D Box Parameters")

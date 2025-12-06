@@ -24,6 +24,14 @@ class BEVCanvas(QtWidgets.QWidget):
     boxSizeChanged = QtCore.pyqtSignal(int, float, float, float)  # box index, new w, new h, new d
     boxDeleted = QtCore.pyqtSignal(int, str, object)  # box index, label, group_id
     
+    # Point signals
+    pointPlaced = QtCore.pyqtSignal(float, float, object)  # x, y, group_id
+    pointSelected = QtCore.pyqtSignal(object)  # group_id (for highlighting in camera views)
+    pointHovered = QtCore.pyqtSignal(object)  # group_id (for highlighting in camera views)
+    pointDoubleClicked = QtCore.pyqtSignal(int, object)  # point_idx, group_id (for editing)
+    pointDeleted = QtCore.pyqtSignal(object)  # group_id
+    pointMoved = QtCore.pyqtSignal(object, float, float)  # group_id, new_x, new_y
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -49,11 +57,15 @@ class BEVCanvas(QtWidgets.QWidget):
         self.hovered_point_idx: Optional[int] = None
         self.point_radius = 8  # radius in pixels
         
+        # Dragging state for points
+        self.dragging_point_idx: Optional[int] = None
+        self.drag_start_pos: Optional[QPointF] = None
+        
         # Drawing state
         self.drawing_box = False
         self.drawing_start_pos: Optional[QPointF] = None
         # Default 3D box size in meters: width, height, depth
-        self.current_box_size = [50.0, 160.0, 50.0]
+        self.current_box_size = [20.0, 20.0, 20.0]
         
         # Movement step size (meters)
         # These will typically be overridden by the control in the BEV dock,
@@ -127,7 +139,7 @@ class BEVCanvas(QtWidgets.QWidget):
         self.hovered_box_idx = None
         self.update()
     
-    def addPoint(self, x: float, y: float, label: str = "object", group_id: int = None):
+    def addPoint(self, x: float, y: float, label: str = "object", group_id: Optional[int] = None):
         """Add a point marker to the BEV canvas"""
         self.points.append((x, y, label, group_id))
         self.update()
@@ -151,17 +163,46 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.update()
                 return True
         return False
+
+    def updatePoint(self, point_idx: int, x: Optional[float] = None, y: Optional[float] = None, 
+                   label: Optional[str] = None, group_id: Optional[int] = None) -> bool:
+        """Update point data by index"""
+        if not (0 <= point_idx < len(self.points)):
+            return False
+        
+        old_x, old_y, old_label, old_gid = self.points[point_idx]
+        new_x = x if x is not None else old_x
+        new_y = y if y is not None else old_y
+        new_label = label if label is not None else old_label
+        new_gid = group_id if group_id is not None else old_gid
+        
+        self.points[point_idx] = (new_x, new_y, new_label, new_gid)
+        self.update()
+        return True
+
+    def getPointByGroupId(self, group_id: int) -> Optional[tuple]:
+        """Get point data by group_id"""
+        for i, (x, y, label, gid) in enumerate(self.points):
+            if gid == group_id:
+                return (i, x, y, label, gid)
+        return None
     
     def _world_to_screen(self, x: float, y: float) -> QPointF:
-        """Convert world coordinates to screen coordinates"""
-        screen_x = (x - self.bev_offset_x) * self.bev_scale + self.width() / 2
-        screen_y = (y - self.bev_offset_y) * self.bev_scale + self.height() / 2
+        """
+        Convert world coordinates to screen coordinates.
+        Origin (0,0) is at top-left of canvas.
+        """
+        screen_x = (x - self.bev_offset_x) * self.bev_scale
+        screen_y = (y - self.bev_offset_y) * self.bev_scale
         return QPointF(screen_x, screen_y)
     
     def _screen_to_world(self, screen_pos: QPointF) -> tuple[float, float]:
-        """Convert screen coordinates to world coordinates"""
-        x = (screen_pos.x() - self.width() / 2) / self.bev_scale + self.bev_offset_x
-        y = (screen_pos.y() - self.height() / 2) / self.bev_scale + self.bev_offset_y
+        """
+        Convert screen coordinates to world coordinates.
+        Origin (0,0) is at top-left of canvas.
+        """
+        x = screen_pos.x() / self.bev_scale + self.bev_offset_x
+        y = screen_pos.y() / self.bev_scale + self.bev_offset_y
         return x, y
     
     def _get_box_at_position(self, pos: QPointF) -> Optional[int]:
@@ -176,6 +217,21 @@ class BEVCanvas(QtWidgets.QWidget):
             dy = pos.y() - screen_center.y()
             
             if abs(dx) <= w_screen / 2 and abs(dy) <= d_screen / 2:
+                return idx
+        
+        return None
+
+    def _get_point_at_position(self, pos: QPointF) -> Optional[int]:
+        """Get point index at given screen position"""
+        for idx, (x, y, label, group_id) in enumerate(self.points):
+            screen_pos = self._world_to_screen(x, y)
+            
+            # Check if click is within point radius
+            dx = pos.x() - screen_pos.x()
+            dy = pos.y() - screen_pos.y()
+            distance = math.sqrt(dx * dx + dy * dy)
+            
+            if distance <= self.point_radius + 2:  # +2 for easier clicking
                 return idx
         
         return None
@@ -288,91 +344,31 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Draw coordinate labels at origin
         p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1))
-        p.drawText(int(origin.x() + 12), int(origin.y() - 12), "Origin (0, 0)")
+        # p.drawText(int(origin.x() + 12), int(origin.y() - 12), "Origin (0, 0)")
         
         # Draw coordinate axes labels
-        p.drawText(int(origin.x() + 12), int(origin.y() + 5), "X →")
-        p.drawText(int(origin.x() - 25), int(origin.y() - 12), "↑ Y")
+        # p.drawText(int(origin.x() + 12), int(origin.y() + 5), "X →")
+        # p.drawText(int(origin.x() - 25), int(origin.y() - 12), "↑ Y")
         
         # Draw camera overlays (positions and FOV)
-        if self.show_camera_overlay and self.camera_calibrations and self.camera_data:
-            for cam_data in self.camera_data:
-                camera_id = cam_data.get("camera_id")
-                calibration = self.camera_calibrations.get(camera_id)
+        # if self.show_camera_overlay and self.camera_calibrations and self.camera_data:
+        #     for cam_data in self.camera_data:
+        #         camera_id = cam_data.get("camera_id")
+        #         calibration = self.camera_calibrations.get(camera_id)
                 
-                if not calibration:
-                    continue
+        #         if not calibration:
+        #             continue
                 
-                # Get camera position in world space
-                R = calibration.extrinsic[:3, :3]
-                t = calibration.extrinsic[:3, 3]
-                camera_pos_world = -R.T @ t
+        #         # Get camera position in world space
+        #         R = calibration.extrinsic[:3, :3]
+        #         t = calibration.extrinsic[:3, 3]
+        #         camera_pos_world = -R.T @ t
                 
-                # Draw camera position
-                cam_screen = self._world_to_screen(camera_pos_world[0], camera_pos_world[1])
-                p.setPen(QtGui.QPen(self.camera_color, 3))
-                p.setBrush(QtGui.QBrush(self.camera_color, Qt.SolidPattern))
-                p.drawEllipse(int(cam_screen.x() - 5), int(cam_screen.y() - 5), 10, 10)
-                
-                # # Draw camera label
-                # p.setPen(QtGui.QPen(self.camera_color, 1))
-                # p.drawText(int(cam_screen.x() + 8), int(cam_screen.y() - 8), camera_id)
-                
-                # Draw camera FOV (project image corners to ground)
-                try:
-                    image_path = cam_data.get("image_path")
-                    if image_path:
-                        image = QtGui.QImage(image_path)
-                        if not image.isNull():
-                            img_width = image.width()
-                            img_height = image.height()
-                        else:
-                            fx = calibration.intrinsic[0, 0]
-                            cx = calibration.intrinsic[0, 2]
-                            img_width = int(cx * 2)
-                            img_height = int(calibration.intrinsic[1, 2] * 2)
-                    else:
-                        fx = calibration.intrinsic[0, 0]
-                        cx = calibration.intrinsic[0, 2]
-                        img_width = int(cx * 2)
-                        img_height = int(calibration.intrinsic[1, 2] * 2)
-                    
-                    fx = calibration.intrinsic[0, 0]
-                    fy = calibration.intrinsic[1, 1]
-                    cx = calibration.intrinsic[0, 2]
-                    cy = calibration.intrinsic[1, 2]
-                    
-                    # Project image corners to ground plane
-                    corners_2d = [
-                        (0, 0),  # top-left
-                        (img_width, 0),  # top-right
-                        (img_width, img_height),  # bottom-right
-                        (0, img_height),  # bottom-left
-                    ]
-                    
-                    fov_points = []
-                    for u, v in corners_2d:
-                        x_norm = (u - cx) / fx
-                        y_norm = (v - cy) / fy
-                        ray_dir_cam = np.array([x_norm, y_norm, 1.0])
-                        ray_dir_cam = ray_dir_cam / np.linalg.norm(ray_dir_cam)
-                        ray_dir_world = R.T @ ray_dir_cam
-                        
-                        if abs(ray_dir_world[2]) > 1e-6:
-                            t_intersect = -camera_pos_world[2] / ray_dir_world[2]
-                            if t_intersect > 0:
-                                point_world = camera_pos_world + t_intersect * ray_dir_world
-                                fov_screen = self._world_to_screen(point_world[0], point_world[1])
-                                fov_points.append(fov_screen)
-                    
-                    # Draw FOV polygon: OUTLINE ONLY so BEV overlay is fully visible
-                    if len(fov_points) >= 3:
-                        polygon = QtGui.QPolygonF(fov_points)
-                        p.setPen(QtGui.QPen(self.camera_color, 1, Qt.DashLine))
-                        p.setBrush(QtCore.Qt.NoBrush)
-                        p.drawPolygon(polygon)
-                except Exception as e:
-                    logger.debug(f"Failed to draw camera FOV for {camera_id}: {e}")
+        #         # Draw camera position only (FOV removed for cleaner view)
+        #         cam_screen = self._world_to_screen(camera_pos_world[0], camera_pos_world[1])
+        #         p.setPen(QtGui.QPen(self.camera_color, 3))
+        #         p.setBrush(QtGui.QBrush(self.camera_color, Qt.SolidPattern))
+        #         p.drawEllipse(int(cam_screen.x() - 5), int(cam_screen.y() - 5), 10, 10)
         
         # Draw 3D boxes (top-down view, showing w and d)
         for idx, (center, size, rotation, label, group_id) in enumerate(self.boxes_3d):
@@ -467,18 +463,38 @@ class BEVCanvas(QtWidgets.QWidget):
         pos = event.localPos()
         
         if event.button() == Qt.LeftButton:
-            # Check if clicking on existing box
+            # First check if clicking on existing point - start dragging
+            point_idx = self._get_point_at_position(pos)
+            if point_idx is not None:
+                self.selected_point_idx = point_idx
+                self.dragging_point_idx = point_idx  # Start dragging
+                self.drag_start_pos = pos
+                _, _, _, group_id = self.points[point_idx]
+                self.pointSelected.emit(group_id)
+                self.update()
+                return
+            
+            # Then check if clicking on existing box
             box_idx = self._get_box_at_position(pos)
             if box_idx is not None:
                 self.selected_box_idx = box_idx
                 self.boxSelected.emit(box_idx)
                 self.update()
             else:
-                # Start drawing new box
-                self.drawing_box = True
-                self.drawing_start_pos = pos
+                # Place a new point at click location
+                x, y = self._screen_to_world(pos)
+                self.pointPlaced.emit(x, y, None)  # group_id will be assigned by MainWindow
                 self.update()
         elif event.button() == Qt.RightButton:
+            # Right-click on point to show context menu
+            point_idx = self._get_point_at_position(pos)
+            if point_idx is not None:
+                self.selected_point_idx = point_idx
+                _, _, _, group_id = self.points[point_idx]
+                self.pointSelected.emit(group_id)
+                self.update()
+                return
+            
             # Right-click to edit box
             box_idx = self._get_box_at_position(pos)
             if box_idx is not None:
@@ -487,9 +503,20 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.update()
     
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        """Handle double-click to edit box size"""
+        """Handle double-click to edit point or box"""
         if event.button() == Qt.LeftButton:
             pos = event.localPos()
+            
+            # First check points
+            point_idx = self._get_point_at_position(pos)
+            if point_idx is not None:
+                self.selected_point_idx = point_idx
+                _, _, _, group_id = self.points[point_idx]
+                self.pointDoubleClicked.emit(point_idx, group_id)
+                self.update()
+                return
+            
+            # Then check boxes
             box_idx = self._get_box_at_position(pos)
             if box_idx is not None:
                 self.selected_box_idx = box_idx
@@ -503,46 +530,98 @@ class BEVCanvas(QtWidgets.QWidget):
         """Handle mouse move"""
         pos = event.localPos()
         
-        # Update hovered box
-        box_idx = self._get_box_at_position(pos)
-        if box_idx != self.hovered_box_idx:
-            self.hovered_box_idx = box_idx
+        # Handle point dragging
+        if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
+            # Get world coordinates for new position
+            new_x, new_y = self._screen_to_world(pos)
+            
+            # Update point position
+            _, _, label, group_id = self.points[self.dragging_point_idx]
+            self.points[self.dragging_point_idx] = (new_x, new_y, label, group_id)
             self.update()
+            return
+        
+        # First check point hover (higher priority)
+        point_idx = self._get_point_at_position(pos)
+        if point_idx != self.hovered_point_idx:
+            old_hovered = self.hovered_point_idx
+            self.hovered_point_idx = point_idx
+            
+            # Emit hover signal for highlighting in camera views
+            if point_idx is not None:
+                _, _, _, group_id = self.points[point_idx]
+                self.pointHovered.emit(group_id)
+            elif old_hovered is not None:
+                # Mouse left point, clear hover highlight
+                self.pointHovered.emit(None)
+            
+            self.update()
+        
+        # Update hovered box (only if not hovering point)
+        if point_idx is None:
+            box_idx = self._get_box_at_position(pos)
+            if box_idx != self.hovered_box_idx:
+                self.hovered_box_idx = box_idx
+                self.update()
         
         if self.drawing_box:
             self.update()
         
         # Update tooltip with world coordinates
         x, y = self._screen_to_world(pos)
-        self.setToolTip(f"X: {x:.2f}m, Y: {y:.2f}m")
+        self.setToolTip(f"X: {x:.2f}, Y: {y:.2f}")
     
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         """Handle mouse release"""
-        if event.button() == Qt.LeftButton and self.drawing_box:
-            pos = event.localPos()
-            x, y = self._screen_to_world(pos)
+        if event.button() == Qt.LeftButton:
+            # Finish point dragging
+            if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
+                # Get final position and emit signal
+                new_x, new_y, label, group_id = self.points[self.dragging_point_idx]
+                self.pointMoved.emit(group_id, new_x, new_y)
+                self.dragging_point_idx = None
+                self.drag_start_pos = None
+                self.update()
+                return
             
-            # Emit signal with box parameters
-            # z will be set by dialog, using default for now
-            self.boxPlaced.emit(
-                x, y, 0.0,  # x, y, z (z will be updated by dialog)
-                self.current_box_size[0],  # w
-                self.current_box_size[1],  # h
-                self.current_box_size[2]   # d
-            )
-            
-            self.drawing_box = False
-            self.drawing_start_pos = None
-            self.update()
+            # Point placement is now handled in mousePressEvent directly
+            if self.drawing_box:
+                self.drawing_box = False
+                self.drawing_start_pos = None
+                self.update()
     
     def setCurrentBoxSize(self, w: float, h: float, d: float):
         """Set current box size for drawing"""
         self.current_box_size = [w, h, d]
     
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        """Handle keyboard input for moving boxes"""
-        # Delete selected box with Delete/Backspace
+        """Handle keyboard input for moving points/boxes and deleting"""
+        # Delete selected point or box with Delete/Backspace
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            # First check if point is selected and valid
+            point_idx_to_delete = self.selected_point_idx
+            if point_idx_to_delete is not None and 0 <= point_idx_to_delete < len(self.points):
+                _, _, _, group_id = self.points[point_idx_to_delete]
+                
+                # Reset selection state BEFORE emitting signal (signal handler might modify state)
+                self.selected_point_idx = None
+                self.hovered_point_idx = None
+                self.dragging_point_idx = None
+                
+                # Emit signal so MainWindow can remove all related 2D boxes
+                self.pointDeleted.emit(group_id)
+                
+                # Remove from points (check again in case signal handler already removed it)
+                # Find by group_id since index may have changed
+                for i, (_, _, _, gid) in enumerate(self.points):
+                    if gid == group_id:
+                        del self.points[i]
+                        break
+                
+                self.update()
+                return
+            
+            # Then check if box is selected
             if self.selected_box_idx is not None and 0 <= self.selected_box_idx < len(self.boxes_3d):
                 center, size, rotation, label, group_id = self.boxes_3d[self.selected_box_idx]
                 # Emit signal so MainWindow can remove all projected 2D boxes
@@ -556,16 +635,44 @@ class BEVCanvas(QtWidgets.QWidget):
                 super().keyPressEvent(event)
             return
 
+        # Check for modifier keys
+        is_shift = event.modifiers() & Qt.ShiftModifier
+        step = self.move_step_large if is_shift else self.move_step
+
+        # Handle point movement with arrow keys
+        if self.selected_point_idx is not None and 0 <= self.selected_point_idx < len(self.points):
+            x, y, label, group_id = self.points[self.selected_point_idx]
+            new_x, new_y = x, y
+            moved = False
+            
+            if event.key() == Qt.Key_Left:
+                new_x -= step
+                moved = True
+            elif event.key() == Qt.Key_Right:
+                new_x += step
+                moved = True
+            elif event.key() == Qt.Key_Up:
+                new_y -= step
+                moved = True
+            elif event.key() == Qt.Key_Down:
+                new_y += step
+                moved = True
+            
+            if moved:
+                # Update point position
+                self.points[self.selected_point_idx] = (new_x, new_y, label, group_id)
+                # Emit signal so MainWindow can update camera bounding boxes
+                self.pointMoved.emit(group_id, new_x, new_y)
+                self.update()
+                return
+        
+        # Handle box movement
         if self.selected_box_idx is None or self.selected_box_idx >= len(self.boxes_3d):
             super().keyPressEvent(event)
             return
         
         # Get current box
         center, size, rotation, label, group_id = self.boxes_3d[self.selected_box_idx]
-        
-        # Check for modifier keys
-        is_shift = event.modifiers() & Qt.ShiftModifier
-        step = self.move_step_large if is_shift else self.move_step
         
         new_center = center.copy()
         moved = False
@@ -607,7 +714,7 @@ class BEVCanvas(QtWidgets.QWidget):
         return None
     
     def updateBox3D(self, box_idx: int, x: float, y: float, z: float, 
-                   w: float = None, h: float = None, d: float = None):
+                   w: Optional[float] = None, h: Optional[float] = None, d: Optional[float] = None):
         """Update 3D box position and/or size"""
         if 0 <= box_idx < len(self.boxes_3d):
             center, size, rotation, label, group_id = self.boxes_3d[box_idx]

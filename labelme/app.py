@@ -149,14 +149,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prev_opened_dir = None
         self._aicv_root_dir = None  # Root directory for AICV folder structure
         
-        # Calibration scale factors
-        self._intrinsic_scale_factor = 0.25  # Default 1/4 scale for K and optimalK
-        self._translation_scale_factor = 100.0  # Default scale for translation in extrinsic
-        
-        # BEV grid parameters
-        self._bev_x = 1200  # BEV grid X dimension (default 600*2)
-        self._bev_y = 800   # BEV grid Y dimension (default 400*2)
-        self._bev_bounds = [0, 600, 0, 400, 0, 200]  # [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
+        # Import default values from constants
+        try:
+            from labelme.utils.constants import (
+                DEFAULT_INTRINSIC_SCALE, DEFAULT_TRANSLATION_SCALE,
+                DEFAULT_BEV_X, DEFAULT_BEV_Y, DEFAULT_BEV_BOUNDS
+            )
+            self._intrinsic_scale_factor = DEFAULT_INTRINSIC_SCALE
+            self._translation_scale_factor = DEFAULT_TRANSLATION_SCALE
+            self._bev_x = DEFAULT_BEV_X
+            self._bev_y = DEFAULT_BEV_Y
+            self._bev_bounds = DEFAULT_BEV_BOUNDS.copy()
+        except ImportError:
+            # Fallback to hardcoded defaults
+            self._intrinsic_scale_factor = 0.25
+            self._translation_scale_factor = 100.0
+            self._bev_x = 1200
+            self._bev_y = 800
+            self._bev_bounds = [0, 600, 0, 400, 0, 200]
 
         # Ground Point List (replaces flags widget)
         self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
@@ -1903,13 +1913,27 @@ class MainWindow(QtWidgets.QMainWindow):
         
         return max_id + 1
 
+    def _get_vox_util(self):
+        """Get or create VoxelUtil instance with current BEV parameters."""
+        try:
+            from labelme.utils.vox_utils import vox
+            import torch
+            
+            X, Y, Z = self._bev_x, self._bev_y, 2
+            bounds = self._bev_bounds
+            scene_centroid = torch.tensor([0.0, 0.0, 0.0]).reshape([1, 3])
+            
+            return vox.VoxelUtil(Y, Z, X, scene_centroid=scene_centroid, bounds=bounds)
+        except Exception as e:
+            logger.warning(f"Failed to create VoxelUtil: {e}")
+            return None
+
     def _worldgrid_to_mem(self, grid_x: float, grid_y: float) -> tuple[float, float]:
         """
         Transform world grid coordinates to memory coordinates for BEV display.
         
-        Uses the same transformation as generate_bev_overlay.py:
-        1. Apply worldgrid2worldcoord (rotation + translation + scale)
-        2. Apply mem_T_ref to convert world coords to memory coords
+        Transformation chain: worldgrid -> worldcoord -> ref -> mem
+        Uses: worldgrid2worldcoord @ ref_T_mem (from vox_util)
         
         Args:
             grid_x, grid_y: World grid coordinates from ground_points
@@ -1917,31 +1941,55 @@ class MainWindow(QtWidgets.QMainWindow):
         Returns:
             (mem_x, mem_y): Memory coordinates for BEV display
         """
-        # Transformation parameters (same as generate_bev_overlay.py)
-        world_x = grid_x
-        world_y = grid_y
-        
-        # Use configurable BEV grid parameters
-        bev_x, bev_y = self._bev_x, self._bev_y
-        XMIN, XMAX = self._bev_bounds[0], self._bev_bounds[1]
-        YMIN, YMAX = self._bev_bounds[2], self._bev_bounds[3]
-        
-        # Voxel sizes
-        vox_size_X = (XMAX - XMIN) / float(bev_x)
-        vox_size_Y = (YMAX - YMIN) / float(bev_y)
-        
-        # Apply mem_T_ref transformation (world -> memory)
-        # Translation: shift by -MIN and -vox_size/2
-        # Scaling: divide by vox_size
-        mem_x = (world_x - XMIN - vox_size_X / 2.0) / vox_size_X
-        mem_y = (world_y - YMIN - vox_size_Y / 2.0) / vox_size_Y
-        
-        return mem_x, mem_y
+        return float(grid_x), float(grid_y)
+        # try:
+        #     import torch
+        #     from labelme.utils.constants import get_worldgrid2worldcoord_torch
+            
+        #     device = 'cpu'
+        #     vox_util = self._get_vox_util()
+            
+        #     if vox_util is None:
+        #         # Fallback to simple identity
+        #         return float(grid_x), float(grid_y)
+            
+        #     X, Y, Z = self._bev_x, self._bev_y, 2
+        #     B = 1
+            
+        #     # Get transformation matrices
+        #     worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3x3
+        #     ref_T_mem = vox_util.get_ref_T_mem(B, Y, Z, X, device=device)  # B x 4 x 4
+            
+        #     # Extract 3x3 submatrix for 2D (rows [0,1,3], cols [0,1,3])
+        #     ref_T_mem_2d = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3x3
+            
+        #     # Combined: worldgrid -> worldcoord -> mem
+        #     # worldcoord_T_mem = worldgrid2worldcoord @ ref_T_mem_2d
+        #     worldcoord_T_mem = torch.matmul(worldgrid2worldcoord, ref_T_mem_2d)  # 3x3
+            
+        #     # Invert to get mem_T_worldgrid (worldgrid -> mem)
+        #     mem_T_worldgrid = torch.inverse(worldcoord_T_mem)  # 3x3
+            
+        #     # Apply transformation to grid point
+        #     grid_pt = torch.tensor([[grid_x, grid_y, 1.0]], dtype=torch.float32, device=device)  # 1x3
+        #     mem_pt = torch.matmul(grid_pt, mem_T_worldgrid.T)  # 1x3
+            
+        #     # Convert from homogeneous
+        #     mem_x = (mem_pt[0, 0] / mem_pt[0, 2]).item()
+        #     mem_y = (mem_pt[0, 1] / mem_pt[0, 2]).item()
+            
+        #     return mem_x, mem_y
+            
+        # except Exception as e:
+        #     logger.warning(f"worldgrid_to_mem failed: {e}, using fallback")
+        #     return float(grid_x), float(grid_y)
 
-    def _mem_to_worldgrid(self, mem_x: float, mem_y: float) -> tuple[int, int]:
+    def _mem_to_worldgrid(self, mem_x: float, mem_y: float) -> tuple[float, float]:
         """
         Transform memory coordinates back to world grid coordinates.
-        Inverse of _worldgrid_to_mem.
+        
+        Transformation chain: mem -> ref -> worldcoord -> worldgrid
+        Uses: ref_T_mem (from vox_util) @ worldcoord2worldgrid
         
         Args:
             mem_x, mem_y: Memory coordinates from BEV display
@@ -1949,40 +1997,44 @@ class MainWindow(QtWidgets.QMainWindow):
         Returns:
             (grid_x, grid_y): World grid coordinates for ground_points
         """
-        # Use configurable BEV grid parameters
-        bev_x, bev_y = self._bev_x, self._bev_y
-        XMIN, XMAX = self._bev_bounds[0], self._bev_bounds[1]
-        YMIN, YMAX = self._bev_bounds[2], self._bev_bounds[3]
-        
-        # Voxel sizes
-        vox_size_X = (XMAX - XMIN) / float(bev_x)
-        vox_size_Y = (YMAX - YMIN) / float(bev_y)
-        
-        # Inverse of mem_T_ref: memory -> world
-        world_x = mem_x * vox_size_X + XMIN + vox_size_X / 2.0
-        world_y = mem_y * vox_size_Y + YMIN + vox_size_Y / 2.0
-        
-        # Transformation parameters
-        theta = -3
-        theta_rad = theta / 180.0 * np.pi
-        cos_t = np.cos(theta_rad)
-        sin_t = np.sin(theta_rad)
-        scale = 0.5
-        tx, ty = -74, -54
-        
-        # Inverse of worldgrid2worldcoord: world -> grid
-        # First subtract translation
-        wx = world_x - tx
-        wy = world_y - ty
-        
-        # Inverse of rotation and scale matrix
-        # Original: [[s*cos, -s*sin], [s*sin, s*cos]]
-        # Inverse: (1/s) * [[cos, sin], [-sin, cos]]
-        inv_scale = 1.0 / scale
-        grid_x = inv_scale * (cos_t * wx + sin_t * wy)
-        grid_y = inv_scale * (-sin_t * wx + cos_t * wy)
-        
-        return int(round(grid_x)), int(round(grid_y))
+        return mem_x, mem_y
+        # try:
+        #     import torch
+        #     from labelme.utils.constants import get_worldgrid2worldcoord_torch
+            
+        #     device = 'cpu'
+        #     vox_util = self._get_vox_util()
+            
+        #     if vox_util is None:
+        #         return int(round(mem_x)), int(round(mem_y))
+            
+        #     X, Y, Z = self._bev_x, self._bev_y, 2
+        #     B = 1
+            
+        #     # Get transformation matrices
+        #     worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3x3
+        #     ref_T_mem = vox_util.get_ref_T_mem(B, Y, Z, X, device=device)  # B x 4 x 4
+            
+        #     # Extract 3x3 submatrix for 2D (rows [0,1,3], cols [0,1,3])
+        #     ref_T_mem_2d = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3x3
+            
+        #     # Combined: worldgrid -> worldcoord -> mem
+        #     worldcoord_T_mem = torch.matmul(worldgrid2worldcoord, ref_T_mem_2d)  # 3x3
+            
+        #     # For mem -> worldgrid, we use worldcoord_T_mem directly
+        #     # Apply transformation to mem point
+        #     mem_pt = torch.tensor([[mem_x, mem_y, 1.0]], dtype=torch.float32, device=device)  # 1x3
+        #     grid_pt = torch.matmul(mem_pt, worldcoord_T_mem.T)  # 1x3
+            
+        #     # Convert from homogeneous
+        #     grid_x = (grid_pt[0, 0] / grid_pt[0, 2]).item()
+        #     grid_y = (grid_pt[0, 1] / grid_pt[0, 2]).item()
+            
+        #     return int(round(grid_x)), int(round(grid_y))
+            
+        # except Exception as e:
+        #     logger.warning(f"mem_to_worldgrid failed: {e}, using fallback")
+            # return int(round(mem_x)), int(round(mem_y))
 
     def _load_global_annotations(self, frame_index: int) -> None:
         """Load global annotations from annotations_positions folder"""
@@ -2036,7 +2088,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     if grid_x >= 0 and grid_y >= 0:
                         # Transform to memory coordinates for BEV display
                         mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
-                        
                         # Add point to BEV canvas (not a box)
                         self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
                 # Add bounding boxes to camera views
@@ -3263,6 +3314,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     bev_width,
                     bev_height,
                     resolution=max(bev_width, bev_height) / 512.0,
+                    bev_x=self._bev_x,
+                    bev_y=self._bev_y,
+                    bev_bounds=self._bev_bounds,
                 )
                 if bev_image is not None:
                     h, w, _ = bev_image.shape
@@ -3493,6 +3547,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 bev_width,
                 bev_height,
                 resolution=bev_scale,
+                bev_x=self._bev_x,
+                bev_y=self._bev_y,
+                bev_bounds=self._bev_bounds,
             )
             if bev_image is not None:
                 h, w, _ = bev_image.shape
@@ -3537,6 +3594,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     bev_width,
                     bev_height,
                     resolution=max(bev_width, bev_height) / 512.0,
+                    bev_x=self._bev_x,
+                    bev_y=self._bev_y,
+                    bev_bounds=self._bev_bounds,
                 )
                 if bev_image is not None:
                     h, w, _ = bev_image.shape
@@ -3561,26 +3621,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bev_canvas.boxSizeChanged.connect(self._on_bev_box_size_changed)
         self.bev_canvas.boxDeleted.connect(self._on_bev_box_deleted)
         
+        # Point signals
+        self.bev_canvas.pointPlaced.connect(self._on_bev_point_placed)
+        self.bev_canvas.pointSelected.connect(self._on_bev_point_selected)
+        self.bev_canvas.pointHovered.connect(self._on_bev_point_hovered)
+        self.bev_canvas.pointDoubleClicked.connect(self._on_bev_point_double_clicked)
+        self.bev_canvas.pointDeleted.connect(self._on_bev_point_deleted)
+        self.bev_canvas.pointMoved.connect(self._on_bev_point_moved)
+        
         # Create dock widget for BEV with step size control
         bev_dock = QtWidgets.QDockWidget("BEV View (3D Box Placement)", self)
         bev_widget = QtWidgets.QWidget()
         bev_layout = QtWidgets.QVBoxLayout()
         bev_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Add step size control
-        step_layout = QtWidgets.QHBoxLayout()
-        step_layout.addWidget(QtWidgets.QLabel("Move Step (m):"))
-        step_spinbox = QtWidgets.QDoubleSpinBox()
-        # Allow very large move steps (up to 1000m as requested)
-        step_spinbox.setRange(0.01, 1000.0)
-        step_spinbox.setValue(15.0)
-        step_spinbox.setDecimals(2)
-        step_spinbox.setSingleStep(0.1)
-        step_spinbox.valueChanged.connect(lambda v: self.bev_canvas.setMoveStep(v))
-        step_layout.addWidget(step_spinbox)
-        step_layout.addStretch()
-        
-        bev_layout.addLayout(step_layout)
+        # bev_layout.addLayout(step_layout)
         bev_layout.addWidget(self.bev_canvas)
         bev_widget.setLayout(bev_layout)
         
@@ -3613,7 +3668,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # Ensure group_id is set
             if group_id is None:
                 group_id = next_group_id
-            
             # Project 3D box to 2D for each camera
             self._project_3d_box_to_cameras(x, y, z, w, h, d, label, group_id)
             
@@ -3739,6 +3793,183 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.remLabels([shape])
             self.multi_camera_canvas.camera_cells[idx] = cell
         
+        self.multi_camera_canvas.update()
+        self._update_ground_point_list()
+        self.setDirty()
+
+    def _on_bev_point_placed(self, x: float, y: float, group_id: Optional[int]):
+        """Handle point placement from BEV canvas - show dialog for configuration"""
+        # Get next unique group_id
+        next_group_id = self._get_next_group_id()
+        
+        # Convert mem coordinates to grid coordinates for display
+        grid_x, grid_y = self._mem_to_worldgrid(x, y)
+        
+        # Show dialog for configuration
+        from labelme.widgets.box3d_dialog import Box3DDialog
+        dialog = Box3DDialog(
+            self,
+            x=grid_x, y=grid_y, z=0.0,
+            w=20.0, h=20.0, d=20.0,  # Default size
+            label="object",
+            group_id=next_group_id
+        )
+        
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            
+            # Convert back to mem coordinates
+            mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
+            
+            # Add the point to BEV canvas
+            self.bev_canvas.addPoint(mem_x, mem_y, new_label, new_group_id)
+            
+            # Update ground point list
+            self._update_ground_point_list()
+            self.setDirty()
+            
+            logger.info(f"Point placed at grid({new_x}, {new_y}) with group_id={new_group_id}")
+
+    def _on_bev_point_selected(self, group_id: Optional[int]):
+        """Handle point selection - highlight related bounding boxes in camera views"""
+        if group_id is not None:
+            self._highlight_shapes_by_group_id(group_id, highlight=True)
+        else:
+            # Clear all highlights
+            self._clear_all_shape_highlights()
+
+    def _on_bev_point_hovered(self, group_id: Optional[int]):
+        """Handle point hover - highlight related bounding boxes in camera views"""
+        # First clear all highlights
+        self._clear_all_shape_highlights()
+        
+        # Then highlight shapes with matching group_id
+        if group_id is not None:
+            self._highlight_shapes_by_group_id(group_id, highlight=True)
+
+    def _clear_all_shape_highlights(self):
+        """Clear all shape highlights in camera views"""
+        if not self.multi_camera_canvas:
+            return
+        
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                if hasattr(shape, '_bev_highlighted'):
+                    shape._bev_highlighted = False
+        
+        self.multi_camera_canvas.update()
+
+    def _on_bev_point_double_clicked(self, point_idx: int, group_id: Optional[int]):
+        """Handle double-click on point - open edit dialog"""
+        if point_idx < 0 or point_idx >= len(self.bev_canvas.points):
+            return
+        
+        x, y, label, gid = self.bev_canvas.points[point_idx]
+        
+        # Convert back to grid coordinates for display
+        grid_x, grid_y = self._mem_to_worldgrid(x, y)
+        
+        from labelme.widgets.box3d_dialog import Box3DDialog
+        dialog = Box3DDialog(
+            self,
+            x=grid_x, y=grid_y, z=0.0,
+            w=20.0, h=20.0, d=20.0,  # Default size
+            label=label,
+            group_id=gid
+        )
+        
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            
+            # Convert back to mem coordinates
+            mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
+            
+            # Update point
+            self.bev_canvas.updatePoint(point_idx, mem_x, mem_y, new_label, new_group_id)
+            
+            # Update ground point list
+            self._update_ground_point_list()
+            self.setDirty()
+
+    def _on_bev_point_deleted(self, group_id: Optional[int]):
+        """Handle point deletion from BEV - remove all related 2D bounding boxes"""
+        if group_id is None:
+            return
+        
+        self._delete_ground_point(group_id)
+
+    def _on_bev_point_moved(self, group_id: Optional[int], new_x: float, new_y: float):
+        """Handle point movement from BEV - update all related 2D bounding boxes"""
+        if group_id is None or not self.multi_camera_canvas:
+            return
+        
+        # Convert mem coordinates to world grid for logging
+        grid_x, grid_y = self._mem_to_worldgrid(new_x, new_y)
+        logger.info(f"Point {group_id} moved to grid({grid_x}, {grid_y})")
+        
+        # Project the new point position to each camera and update bounding boxes
+        mem_point = np.array([[new_x, new_y]], dtype=np.float32)
+        
+        for cam_idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data.get("camera_id", f"Camera{cam_idx}")
+            calibration = self.camera_calibrations.get(camera_id)
+            
+            if not calibration:
+                continue
+            
+            # Project the new point to this camera
+            try:
+                projected = calibration.project_mem_to_2d(
+                    mem_point,
+                    bev_x=self._bev_x,
+                    bev_y=self._bev_y,
+                    bev_bounds=self._bev_bounds,
+                    apply_distortion=True
+                )
+                
+                if np.isnan(projected).any():
+                    continue
+                
+                new_center_x, new_center_y = projected[0]
+                
+                # Find and update the shape with matching group_id in this camera
+                cell = self.multi_camera_canvas.camera_cells[cam_idx]
+                for shape in cell.shapes:
+                    if shape.group_id == group_id:
+                        # Get current bounding box dimensions
+                        if len(shape.points) >= 2:
+                            old_xmin = min(p.x() for p in shape.points)
+                            old_xmax = max(p.x() for p in shape.points)
+                            old_ymin = min(p.y() for p in shape.points)
+                            old_ymax = max(p.y() for p in shape.points)
+                            
+                            # Calculate current dimensions
+                            width = old_xmax - old_xmin
+                            height = old_ymax - old_ymin
+                            
+                            # Calculate new bounding box centered on projected point
+                            # Keep bottom of box at projected point (foot position)
+                            new_xmin = new_center_x - width / 2
+                            new_xmax = new_center_x + width / 2
+                            new_ymax = new_center_y  # Foot at projected point
+                            new_ymin = new_center_y - height
+                            
+                            # Update shape points (for rectangle: top-left, bottom-right)
+                            if len(shape.points) == 2:
+                                shape.points[0] = QtCore.QPointF(new_xmin, new_ymin)
+                                shape.points[1] = QtCore.QPointF(new_xmax, new_ymax)
+                            elif len(shape.points) == 4:
+                                # Rectangle with 4 corners
+                                shape.points[0] = QtCore.QPointF(new_xmin, new_ymin)
+                                shape.points[1] = QtCore.QPointF(new_xmax, new_ymin)
+                                shape.points[2] = QtCore.QPointF(new_xmax, new_ymax)
+                                shape.points[3] = QtCore.QPointF(new_xmin, new_ymax)
+                        break
+                
+            except Exception as e:
+                logger.warning(f"Failed to project point to camera {camera_id}: {e}")
+        
+        # Update displays
         self.multi_camera_canvas.update()
         self._update_ground_point_list()
         self.setDirty()

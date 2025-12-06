@@ -1,17 +1,17 @@
 """Utilities for loading and using camera calibrations for 3D projection"""
 
+import cv2
+import torch
 import json
-import os.path as osp
-import xml.etree.ElementTree as ET
-from typing import Optional, Dict, Any, List
 import numpy as np
+import os.path as osp
 from loguru import logger
 
-try:
-    import cv2
-except ImportError:
-    cv2 = None
-    logger.warning("OpenCV not available, calibration loading may fail")
+import xml.etree.ElementTree as ET
+from typing import Optional, Dict, Any, List
+
+from labelme.utils.vox_utils import vox
+from labelme.utils.constants import get_worldgrid2worldcoord_torch, DEFAULT_BEV_BOUNDS
 
 
 class CameraCalibration:
@@ -238,12 +238,32 @@ class CameraCalibration:
             logger.error(f"Failed to load calibration from {filepath}: {e}")
             return None
     
-    def project_3d_to_2d(self, points_3d: np.ndarray) -> np.ndarray:
+    def project_3d_to_2d(
+        self, 
+        points_3d: np.ndarray, 
+        apply_distortion: bool = True,
+        from_mem: bool = False,
+        bev_x: int = 1200,
+        bev_y: int = 800,
+        bev_bounds: Optional[List] = None,
+    ) -> np.ndarray:
         """
-        Project 3D points to 2D image coordinates using OpenCV model.
+        Project 3D points to 2D image coordinates.
+        
+        If from_mem=True, applies full transformation chain:
+            mem -> ref (ref_T_mem) -> world (worldgrid2worldcoord) -> camera (extrinsic) 
+            -> pixel (intrinsic) -> distorted
+        
+        If from_mem=False, applies standard projection:
+            world -> camera (extrinsic) -> pixel (intrinsic) -> distorted
         
         Args:
-            points_3d: Nx3 array of 3D points in world coordinates
+            points_3d: Nx3 array of points (mem coordinates if from_mem=True, else world coordinates)
+            apply_distortion: Whether to apply lens distortion
+            from_mem: If True, input is memory coordinates; apply ref_T_mem and worldgrid2worldcoord first
+            bev_x: BEV grid X dimension (only used if from_mem=True)
+            bev_y: BEV grid Y dimension (only used if from_mem=True)
+            bev_bounds: BEV bounds (only used if from_mem=True)
             
         Returns:
             Nx2 array of 2D image coordinates, NaN for points behind camera.
@@ -253,29 +273,251 @@ class CameraCalibration:
         
         # Ensure float32
         points_3d = np.asarray(points_3d, dtype=np.float32)
-        
-        # Compute camera coordinates to know which points are in front of camera
         n_points = points_3d.shape[0]
+        
+        # If from_mem, apply ref_T_mem and worldgrid2worldcoord transformations
+
+        
+        if bev_bounds is None:
+            bev_bounds = DEFAULT_BEV_BOUNDS
+        
+        device = 'cpu'
+        B = 1
+        X, Y, Z = bev_x, bev_y, 2
+        
+        # Create VoxelUtil
+        scene_centroid = torch.tensor([0.0, 0.0, 0.0]).reshape([1, 3])
+        vox_util = vox.VoxelUtil(Y, Z, X, scene_centroid=scene_centroid, bounds=bev_bounds)
+        
+        # Get transformation matrices
+        ref_T_mem = vox_util.get_ref_T_mem(B, Y, Z, X, device=device)  # B x 4 x 4
+        worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3 x 3 
+        
+        # Extract 3x3 submatrix for 2D homography (rows [0,1,3], cols [0,1,3])
+        ref_T_mem_2d = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3x3
+        
+        # Combined 2D transformation: worldcoord_T_mem = worldgrid2worldcoord @ ref_T_mem_2d
+        worldcoord_T_mem = torch.matmul(worldgrid2worldcoord, ref_T_mem_2d)  # 3x3
+        
+        # Convert mem points (x, y, z) to homogeneous 2D (x, y, 1) for ground plane
+        mem_pts_2d = torch.tensor(
+            np.hstack([points_3d[:, :2], np.ones((n_points, 1))]),
+            dtype=torch.float32, device=device
+        )  # N x 3
+        
+        # Transform mem -> world coordinates (2D on ground plane)
+        world_pts_homo = torch.matmul(mem_pts_2d, worldcoord_T_mem.T)  # N x 3
+        world_2d = world_pts_homo[:, :2] / world_pts_homo[:, 2:3]  # N x 2
+        
+        # Create 3D world points using transformed x,y and original z
+        points_3d = np.zeros((n_points, 3), dtype=np.float32)
+        points_3d[:, 0] = world_2d[:, 0].numpy()
+        points_3d[:, 1] = world_2d[:, 1].numpy()
+        points_3d[:, 2] = 0.0  # Ground plane (z from mem is typically 0)
+                
+        # Compute camera coordinates to know which points are in front of camera
         points_3d_homogeneous = np.hstack([points_3d, np.ones((n_points, 1), dtype=np.float32)])
         points_cam = (self.extrinsic @ points_3d_homogeneous.T).T
         valid_mask = points_cam[:, 2] > 0  # z > 0 in camera frame
+        
         # Use OpenCV's projectPoints for consistency with calibration files
         R = self.extrinsic[:3, :3]
         t = self.extrinsic[:3, 3]
         rvec, _ = cv2.Rodrigues(R)
+        
+        # Apply distortion if requested
+        dist_coeffs = self.distortion if apply_distortion else None
+        
         image_points, _ = cv2.projectPoints(
             points_3d,
             rvec,
             t,
             self.intrinsic,
-            self.distortion,
+            dist_coeffs,
         )
         result = image_points.reshape(-1, 2)
-
         
         # Mark invalid points as NaN
         result = result.astype(np.float32)
         result[~valid_mask] = np.nan
+        
+        return result
+
+    def project_mem_to_2d(
+        self, 
+        mem_points: np.ndarray,
+        bev_x: int = 1200,
+        bev_y: int = 800,
+        bev_bounds: Optional[List] = None,
+        apply_distortion: bool = True,
+    ) -> np.ndarray:
+        """
+        Project BEV memory coordinates to 2D image coordinates.
+        
+        Full transformation chain using ref_T_mem and worldgrid2worldcoord:
+            mem -> ref (via ref_T_mem) -> world (via worldgrid2worldcoord) -> world_3d (z=0)
+            -> camera (via extrinsic) -> pixel (via intrinsic) -> distorted (via distortion)
+        
+        Args:
+            mem_points: Nx2 array of memory (BEV pixel) coordinates
+            bev_x: BEV grid X dimension
+            bev_y: BEV grid Y dimension  
+            bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
+            apply_distortion: Whether to apply lens distortion
+            
+        Returns:
+            Nx2 array of 2D image coordinates, NaN for invalid points.
+        """
+        n_points = mem_points.shape[0]
+        
+        # Convert 2D mem points to 3D (with z=0)
+        points_3d = np.zeros((n_points, 3), dtype=np.float32)
+        points_3d[:, 0] = mem_points[:, 0]
+        points_3d[:, 1] = mem_points[:, 1]
+        points_3d[:, 2] = 0.0  # Ground plane
+        
+        # Use project_3d_to_2d with from_mem=True to apply full transformation chain
+        result = self.project_3d_to_2d(
+            points_3d, 
+            apply_distortion=apply_distortion,
+            from_mem=True,
+            bev_x=bev_x,
+            bev_y=bev_y,
+            bev_bounds=bev_bounds
+        )
+        
+        return result
+
+    def project_2d_to_mem(
+        self,
+        pixel_points: np.ndarray,
+        bev_x: int = 1200,
+        bev_y: int = 800,
+        bev_bounds: Optional[List] = None,
+        ground_z: float = 0.0,
+        apply_undistortion: bool = True,
+    ) -> np.ndarray:
+        """
+        Project 2D image coordinates back to BEV memory coordinates (inverse of project_mem_to_2d).
+        
+        Transformation chain (inverse):
+            pixel -> undistorted (via undistortPoints) -> normalized -> camera_ray
+            -> world_3d (intersect ground plane) -> world_2d -> mem (via inverse of worldcoord_T_mem)
+        
+        Assumes points lie on the ground plane (z=ground_z).
+        
+        Args:
+            pixel_points: Nx2 array of 2D image coordinates (possibly distorted)
+            bev_x: BEV grid X dimension
+            bev_y: BEV grid Y dimension
+            bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
+            ground_z: Height of the ground plane in world coordinates
+            apply_undistortion: Whether to undistort input pixel coordinates
+            
+        Returns:
+            Nx2 array of BEV memory coordinates.
+        """
+        try:
+            import torch
+            from labelme.utils.vox_utils import vox
+            from labelme.utils.constants import get_worldgrid2worldcoord_torch, DEFAULT_BEV_BOUNDS
+        except ImportError as e:
+            logger.warning(f"Cannot import vox_utils or constants: {e}")
+            return np.full((pixel_points.shape[0], 2), np.nan, dtype=np.float32)
+        
+        if bev_bounds is None:
+            bev_bounds = DEFAULT_BEV_BOUNDS
+        
+        device = 'cpu'
+        B = 1
+        X, Y, Z = bev_x, bev_y, 2
+        n_points = pixel_points.shape[0]
+        
+        # Step 1: Undistort pixel points if needed
+        if apply_undistortion and cv2 is not None and self.distortion is not None:
+            # cv2.undistortPoints returns normalized coordinates
+            # We need to convert back to pixel coordinates
+            pixel_points_reshaped = pixel_points.reshape(-1, 1, 2).astype(np.float32)
+            undistorted_normalized = cv2.undistortPoints(
+                pixel_points_reshaped,
+                self.intrinsic,
+                self.distortion,
+                P=self.intrinsic  # Re-project to pixel space
+            )
+            pixel_points = undistorted_normalized.reshape(-1, 2)
+        
+        # Create VoxelUtil
+        scene_centroid = torch.tensor([0.0, 0.0, 0.0]).reshape([1, 3])
+        vox_util = vox.VoxelUtil(Y, Z, X, scene_centroid=scene_centroid, bounds=bev_bounds)
+        
+        # Get transformation matrices
+        ref_T_mem = vox_util.get_ref_T_mem(B, Y, Z, X, device=device)  # B x 4 x 4
+        worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3 x 3
+        
+        # Extract 3x3 submatrix for 2D homography
+        ref_T_mem_2d = ref_T_mem[0, [0, 1, 3]][:, [0, 1, 3]]  # 3x3
+        
+        # Combined: worldcoord_T_mem = worldgrid2worldcoord @ ref_T_mem_2d
+        worldcoord_T_mem = torch.matmul(worldgrid2worldcoord, ref_T_mem_2d)  # 3x3
+        
+        # Inverse: mem_T_worldcoord
+        mem_T_worldcoord = torch.inverse(worldcoord_T_mem)  # 3x3
+        
+        # Convert calibration to torch
+        intrinsic = torch.tensor(self.intrinsic, dtype=torch.float32, device=device)
+        extrinsic = torch.tensor(self.extrinsic, dtype=torch.float32, device=device)
+        
+        # Get camera position and orientation
+        R = extrinsic[:3, :3]
+        t = extrinsic[:3, 3]
+        R_inv = R.T
+        camera_pos = -R_inv @ t  # Camera position in world coords
+        
+        # Inverse intrinsic
+        K_inv = torch.inverse(intrinsic)
+        
+        # Convert pixel points to torch homogeneous
+        pixel_homo = torch.tensor(
+            np.hstack([pixel_points, np.ones((n_points, 1))]),
+            dtype=torch.float32, device=device
+        )  # N x 3
+        
+        # Unproject to camera ray direction: ray_dir_cam = K_inv @ pixel
+        ray_dir_cam = torch.matmul(pixel_homo, K_inv.T)  # N x 3
+        
+        # Transform ray direction to world coordinates
+        ray_dir_world = torch.matmul(ray_dir_cam, R_inv.T)  # N x 3
+        
+        # Intersect with ground plane z = ground_z
+        # Ray: P = camera_pos + t * ray_dir_world
+        # Ground: P.z = ground_z
+        # Solve: camera_pos.z + t * ray_dir_world.z = ground_z
+        # t = (ground_z - camera_pos.z) / ray_dir_world.z
+        
+        # Avoid division by zero
+        ray_z = ray_dir_world[:, 2].clone()
+        ray_z[ray_z.abs() < 1e-6] = 1e-6
+        
+        t_intersect = (ground_z - camera_pos[2]) / ray_z
+        
+        # Calculate world intersection points
+        world_pts = camera_pos.unsqueeze(0) + t_intersect.unsqueeze(1) * ray_dir_world  # N x 3
+        
+        # World coords (x, y) to homogeneous for 2D transform
+        world_2d_homo = torch.cat([
+            world_pts[:, :2],
+            torch.ones((n_points, 1), device=device)
+        ], dim=1)  # N x 3
+        
+        # Transform to mem coordinates: mem = mem_T_worldcoord @ world_2d
+        mem_pts = torch.matmul(world_2d_homo, mem_T_worldcoord.T)  # N x 3
+        mem_2d = mem_pts[:, :2] / mem_pts[:, 2:3]  # N x 2
+        
+        # Check validity (t_intersect > 0 means in front of camera)
+        valid_mask = t_intersect > 0
+        
+        result = mem_2d.numpy().astype(np.float32)
+        result[~valid_mask.numpy()] = np.nan
         
         return result
     
@@ -383,49 +625,54 @@ def generate_bev_from_cameras(
     bev_width: float,
     bev_height: float,
     resolution: float = 0.2,
+    bev_x: int = 1200,
+    bev_y: int = 800,
+    bev_bounds: Optional[List] = None,
 ) -> Optional[np.ndarray]:
     """
     Generate a simple BEV (top-down) image from multiple cameras.
-
-    The ground plane is assumed to be z=0 in world coordinates and the BEV
-    covers [-bev_width/2, bev_width/2] x [-bev_height/2, bev_height/2].
+    
+    Uses memory coordinate system for projection with from_mem=True.
 
     Args:
         camera_calibrations: mapping camera_id -> CameraCalibration.
         camera_data: list of dicts with at least keys: 'camera_id', 'image_path'.
-        bev_width: BEV width in meters.
-        bev_height: BEV height in meters.
+        bev_width: BEV width (used for display bounds).
+        bev_height: BEV height (used for display bounds).
         resolution: meters per pixel (smaller -> higher resolution).
+        bev_x: BEV grid X dimension
+        bev_y: BEV grid Y dimension
+        bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
 
     Returns:
         HxWx3 uint8 RGB image, or None if generation fails.
     """
     try:
         import cv2  # type: ignore[import]
+        from labelme.utils.constants import DEFAULT_BEV_BOUNDS
     except Exception:
-        logger.warning("OpenCV not available, cannot generate BEV overlay")
+        logger.warning("OpenCV or constants not available, cannot generate BEV overlay")
         return None
 
     if not camera_calibrations or not camera_data:
         return None
+    
+    if bev_bounds is None:
+        bev_bounds = DEFAULT_BEV_BOUNDS
 
-    # Determine BEV grid size in pixels
-    bev_width = float(bev_width)
-    bev_height = float(bev_height)
-    resolution = float(max(resolution, 1e-3))
+    # Use BEV grid dimensions directly
+    n_x = bev_x
+    n_y = bev_y
 
-    n_x = max(1, int(bev_width / resolution))
-    n_y = max(1, int(bev_height / resolution))
-
-    # World coordinates on ground plane (z=0), centered at origin
-    xs = np.linspace(-bev_width / 2.0, bev_width / 2.0, n_x, dtype=np.float32)
-    ys = np.linspace(-bev_height / 2.0, bev_height / 2.0, n_y, dtype=np.float32)
-    X, Y = np.meshgrid(xs, ys)
-    Z = np.zeros_like(X, dtype=np.float32)
-    points_world = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)  # (N,3)
-
-    accum = np.zeros((points_world.shape[0], 3), dtype=np.float32)
-    counts = np.zeros(points_world.shape[0], dtype=np.int32)
+    # Generate memory coordinates grid (0 to bev_x, 0 to bev_y)
+    # Memory coordinates are in the range [0, X) and [0, Y)
+    xs_mem = np.linspace(0, bev_x - 1, n_x, dtype=np.float32)
+    ys_mem = np.linspace(0, bev_y - 1, n_y, dtype=np.float32)
+    X_mem, Y_mem = np.meshgrid(xs_mem, ys_mem)
+    Z_mem = np.zeros_like(X_mem, dtype=np.float32)
+    points_mem = np.stack([X_mem.ravel(), Y_mem.ravel(), Z_mem.ravel()], axis=1)  # (N,3)
+    accum = np.zeros((points_mem.shape[0], 3), dtype=np.float32)
+    counts = np.zeros(points_mem.shape[0], dtype=np.int32)
 
     for cam in camera_data:
         camera_id = cam.get("camera_id")
@@ -444,9 +691,15 @@ def generate_bev_from_cameras(
 
         h, w = img.shape[:2]
 
-        # Project ground points into this camera
-        # print("generate canvas")  # REMOVED - debug statement
-        pts_2d = calib.project_3d_to_2d(points_world)  # (N,2) with NaNs for invalid
+        # Project memory grid points into this camera using from_mem=True
+        pts_2d = calib.project_3d_to_2d(
+            points_mem, 
+            apply_distortion=True,
+            from_mem=True,
+            bev_x=bev_x,
+            bev_y=bev_y,
+            bev_bounds=bev_bounds
+        )  # (N,2) with NaNs for invalid
         valid = ~np.isnan(pts_2d).any(axis=1)
         if not np.any(valid):
             continue
@@ -479,7 +732,7 @@ def generate_bev_from_cameras(
         logger.warning("No valid BEV pixels generated from cameras")
         return None
 
-    bev = np.zeros((points_world.shape[0], 3), dtype=np.uint8)
+    bev = np.zeros((points_mem.shape[0], 3), dtype=np.uint8)
     bev[valid_points] = (accum[valid_points] / counts[valid_points, None]).astype(
         np.uint8
     )
