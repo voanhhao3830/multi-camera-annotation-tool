@@ -2083,7 +2083,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     # ground_points are world grid coordinates (grid_x, grid_y)
                     grid_x = ground_points[0]
                     grid_y = ground_points[1]
-                    
+                    print(f"grid_x: {grid_x}, grid_y: {grid_y}")
                     # Check if ground_points are valid (positive values)
                     if grid_x >= 0 and grid_y >= 0:
                         # Transform to memory coordinates for BEV display

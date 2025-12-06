@@ -44,8 +44,8 @@ WORLDCOORD2WORLDGRID_MAT = np.linalg.inv(WORLDGRID2WORLDCOORD_MAT).astype(np.flo
 # ============================================================================
 
 # Default BEV grid dimensions
-DEFAULT_BEV_X = 600 * 2  # Grid X dimension (pixels)
-DEFAULT_BEV_Y = 400  * 2  # Grid Y dimension (pixels)
+DEFAULT_BEV_X = 600   # Grid X dimension (pixels)
+DEFAULT_BEV_Y = 400   # Grid Y dimension (pixels)
 DEFAULT_BEV_Z = 2     # Grid Z dimension (height levels)
 
 # Default BEV bounds in world units [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]

@@ -13,6 +13,7 @@ from PyQt5.QtCore import QPointF, Qt
 from loguru import logger
 
 from labelme.shape import Shape
+from labelme.utils.constants import DEFAULT_BEV_X, DEFAULT_BEV_Y
 
 
 class BEVCanvas(QtWidgets.QWidget):
@@ -40,11 +41,16 @@ class BEVCanvas(QtWidgets.QWidget):
         self.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard focus
         
         # BEV view settings
-        self.bev_scale = 1.0  # pixels per meter
-        self.bev_offset_x = 0.0  # offset in meters
-        self.bev_offset_y = 0.0  # offset in meters
-        self.bev_width = 50.0  # meters
-        self.bev_height = 50.0  # meters
+        # Grid dimensions from constants (pixels in grid space)
+        self.grid_width = DEFAULT_BEV_X  # Grid X dimension (1200 pixels)
+        self.grid_height = DEFAULT_BEV_Y  # Grid Y dimension (800 pixels)
+        
+        # Legacy fields (kept for compatibility but not used with grid scaling)
+        self.bev_scale = 1.0  # pixels per meter (legacy)
+        self.bev_offset_x = 0.0  # offset in meters (legacy)
+        self.bev_offset_y = 0.0  # offset in meters (legacy)
+        self.bev_width = 50.0  # meters (legacy)
+        self.bev_height = 50.0  # meters (legacy)
         
         # 3D boxes: list of (center, size, rotation, label, group_id)
         self.boxes_3d: list[tuple] = []
@@ -120,10 +126,34 @@ class BEVCanvas(QtWidgets.QWidget):
         self.update()
     
     def setBEVParams(self, width: float, height: float, scale: float = 1.0):
-        """Set BEV view parameters"""
+        """
+        Set BEV view parameters (legacy method for compatibility).
+        
+        Note: This method is kept for backward compatibility but the grid scaling
+        is now based on DEFAULT_BEV_X and DEFAULT_BEV_Y from constants.
+        
+        Args:
+            width: BEV width (legacy, not used)
+            height: BEV height (legacy, not used)
+            scale: BEV scale (legacy, not used)
+        """
+        logger.warning("setBEVParams is deprecated. Grid scaling now uses constants.DEFAULT_BEV_X and DEFAULT_BEV_Y")
         self.bev_width = width
         self.bev_height = height
         self.bev_scale = scale
+        self.update()
+    
+    def setGridDimensions(self, grid_width: int, grid_height: int):
+        """
+        Update grid dimensions for coordinate transformation.
+        
+        Args:
+            grid_width: Grid width in pixels (e.g., DEFAULT_BEV_X = 1200)
+            grid_height: Grid height in pixels (e.g., DEFAULT_BEV_Y = 800)
+        """
+        logger.info(f"Setting grid dimensions to {grid_width} x {grid_height}")
+        self.grid_width = grid_width
+        self.grid_height = grid_height
         self.update()
     
     def addBox3D(self, x: float, y: float, z: float, w: float, h: float, d: float,
@@ -187,30 +217,74 @@ class BEVCanvas(QtWidgets.QWidget):
                 return (i, x, y, label, gid)
         return None
     
-    def _world_to_screen(self, x: float, y: float) -> QPointF:
+    def _grid_to_screen(self, grid_x: float, grid_y: float) -> QPointF:
         """
-        Convert world coordinates to screen coordinates.
-        Origin (0,0) is at top-left of canvas.
+        Convert grid coordinates (mem coordinates) to screen coordinates.
+        
+        Grid space: (0, 0) at top-left, extends to (grid_width, grid_height)
+        Screen space: (0, 0) at top-left of canvas widget
+        
+        Args:
+            grid_x, grid_y: Coordinates in grid space (0 to DEFAULT_BEV_X, 0 to DEFAULT_BEV_Y)
+            
+        Returns:
+            QPointF with screen coordinates
         """
-        screen_x = (x - self.bev_offset_x) * self.bev_scale
-        screen_y = (y - self.bev_offset_y) * self.bev_scale
-        return QPointF(screen_x, screen_y)
+        try:
+            canvas_width = self.width()
+            canvas_height = self.height()
+            
+            # Scale from grid space to canvas space
+            scale_x = canvas_width / self.grid_width
+            scale_y = canvas_height / self.grid_height
+            
+            screen_x = grid_x * scale_x
+            screen_y = grid_y * scale_y
+            print(f"canvas_width: {canvas_width}, canvas_height: {canvas_height}")
+            print(f"grid_to_screen: {grid_x}, {grid_y} -> {screen_x}, {screen_y}")
+            return QPointF(screen_x, screen_y)
+        except Exception as e:
+            logger.error(f"Error in _grid_to_screen({grid_x}, {grid_y}): {e}")
+            return QPointF(0, 0)
     
-    def _screen_to_world(self, screen_pos: QPointF) -> tuple[float, float]:
+    def _screen_to_grid(self, screen_pos: QPointF) -> tuple[float, float]:
         """
-        Convert screen coordinates to world coordinates.
-        Origin (0,0) is at top-left of canvas.
+        Convert screen coordinates to grid coordinates (mem coordinates).
+        
+        Screen space: (0, 0) at top-left of canvas widget
+        Grid space: (0, 0) at top-left, extends to (grid_width, grid_height)
+        
+        Args:
+            screen_pos: Position in screen/canvas coordinates
+            
+        Returns:
+            (grid_x, grid_y): Coordinates in grid space
         """
-        x = screen_pos.x() / self.bev_scale + self.bev_offset_x
-        y = screen_pos.y() / self.bev_scale + self.bev_offset_y
-        return x, y
+        try:
+            canvas_width = self.width()
+            canvas_height = self.height()
+            
+            # Scale from canvas space to grid space
+            scale_x = self.grid_width / canvas_width
+            scale_y = self.grid_height / canvas_height
+            
+            grid_x = screen_pos.x() * scale_x
+            grid_y = screen_pos.y() * scale_y
+            
+            return grid_x, grid_y
+        except Exception as e:
+            logger.error(f"Error in _screen_to_grid({screen_pos.x()}, {screen_pos.y()}): {e}")
+            return 0.0, 0.0
     
     def _get_box_at_position(self, pos: QPointF) -> Optional[int]:
         """Get box index at given screen position"""
         for idx, (center, size, rotation, _, _) in enumerate(self.boxes_3d):
-            screen_center = self._world_to_screen(center[0], center[1])
-            w_screen = size[0] * self.bev_scale  # width
-            d_screen = size[2] * self.bev_scale  # depth
+            screen_center = self._grid_to_screen(center[0], center[1])
+            # Calculate screen size based on canvas/grid scaling
+            canvas_width = self.width()
+            scale_x = canvas_width / self.grid_width
+            w_screen = size[0] * scale_x  # width in screen pixels
+            d_screen = size[2] * scale_x  # depth in screen pixels
             
             # Simple rectangle check (ignoring rotation for now)
             dx = pos.x() - screen_center.x()
@@ -224,7 +298,7 @@ class BEVCanvas(QtWidgets.QWidget):
     def _get_point_at_position(self, pos: QPointF) -> Optional[int]:
         """Get point index at given screen position"""
         for idx, (x, y, label, group_id) in enumerate(self.points):
-            screen_pos = self._world_to_screen(x, y)
+            screen_pos = self._grid_to_screen(x, y)
             
             # Check if click is within point radius
             dx = pos.x() - screen_pos.x()
@@ -337,7 +411,7 @@ class BEVCanvas(QtWidgets.QWidget):
                 iteration += 1
         
         # Draw origin with coordinate labels
-        origin = self._world_to_screen(0, 0)
+        origin = self._grid_to_screen(0, 0)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 0, 0), 2))
         p.drawLine(int(origin.x() - 10), int(origin.y()), int(origin.x() + 10), int(origin.y()))
         p.drawLine(int(origin.x()), int(origin.y() - 10), int(origin.x()), int(origin.y() + 10))
@@ -365,17 +439,19 @@ class BEVCanvas(QtWidgets.QWidget):
         #         camera_pos_world = -R.T @ t
                 
         #         # Draw camera position only (FOV removed for cleaner view)
-        #         cam_screen = self._world_to_screen(camera_pos_world[0], camera_pos_world[1])
+        #         cam_screen = self._grid_to_screen(camera_pos_world[0], camera_pos_world[1])
         #         p.setPen(QtGui.QPen(self.camera_color, 3))
         #         p.setBrush(QtGui.QBrush(self.camera_color, Qt.SolidPattern))
         #         p.drawEllipse(int(cam_screen.x() - 5), int(cam_screen.y() - 5), 10, 10)
         
         # Draw 3D boxes (top-down view, showing w and d)
         for idx, (center, size, rotation, label, group_id) in enumerate(self.boxes_3d):
-            screen_center = self._world_to_screen(center[0], center[1])
-            # Use w (width) and d (depth) for BEV display
-            w_screen = size[0] * self.bev_scale  # width
-            d_screen = size[2] * self.bev_scale  # depth
+            screen_center = self._grid_to_screen(center[0], center[1])
+            # Calculate screen size based on canvas/grid scaling
+            canvas_width = self.width()
+            scale_x = canvas_width / self.grid_width
+            w_screen = size[0] * scale_x  # width in screen pixels
+            d_screen = size[2] * scale_x  # depth in screen pixels
             
             # Determine color
             if idx == self.selected_box_idx:
@@ -404,7 +480,7 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Draw points (simple markers)
         for idx, (x, y, label, group_id) in enumerate(self.points):
-            screen_pos = self._world_to_screen(x, y)
+            screen_pos = self._grid_to_screen(x, y)
             
             # Determine color based on group_id for consistency
             if group_id is not None:
@@ -438,13 +514,16 @@ class BEVCanvas(QtWidgets.QWidget):
         # Draw current drawing box
         if self.drawing_box and self.drawing_start_pos:
             current_pos = self.drawing_start_pos
-            x, y = self._screen_to_world(current_pos)
-            center_x_world, center_y_world = self._screen_to_world(self.drawing_start_pos)
+            x, y = self._screen_to_grid(current_pos)
+            center_x_grid, center_y_grid = self._screen_to_grid(self.drawing_start_pos)
             
             # Draw preview box (top-down view: w x d)
-            screen_center = self._world_to_screen(center_x_world, center_y_world)
-            w_screen = self.current_box_size[0] * self.bev_scale  # width
-            d_screen = self.current_box_size[2] * self.bev_scale  # depth
+            screen_center = self._grid_to_screen(center_x_grid, center_y_grid)
+            # Calculate screen size based on canvas/grid scaling
+            canvas_width = self.width()
+            scale_x = canvas_width / self.grid_width
+            w_screen = self.current_box_size[0] * scale_x  # width in screen pixels
+            d_screen = self.current_box_size[2] * scale_x  # depth in screen pixels
             
             p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 2, Qt.DashLine))
             p.setBrush(QtCore.Qt.NoBrush)
@@ -482,7 +561,7 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.update()
             else:
                 # Place a new point at click location
-                x, y = self._screen_to_world(pos)
+                x, y = self._screen_to_grid(pos)
                 self.pointPlaced.emit(x, y, None)  # group_id will be assigned by MainWindow
                 self.update()
         elif event.button() == Qt.RightButton:
@@ -532,8 +611,8 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Handle point dragging
         if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
-            # Get world coordinates for new position
-            new_x, new_y = self._screen_to_world(pos)
+            # Get grid coordinates for new position
+            new_x, new_y = self._screen_to_grid(pos)
             
             # Update point position
             _, _, label, group_id = self.points[self.dragging_point_idx]
@@ -567,9 +646,9 @@ class BEVCanvas(QtWidgets.QWidget):
         if self.drawing_box:
             self.update()
         
-        # Update tooltip with world coordinates
-        x, y = self._screen_to_world(pos)
-        self.setToolTip(f"X: {x:.2f}, Y: {y:.2f}")
+        # Update tooltip with grid coordinates
+        x, y = self._screen_to_grid(pos)
+        self.setToolTip(f"Grid X: {x:.1f}, Grid Y: {y:.1f}")
     
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         """Handle mouse release"""
