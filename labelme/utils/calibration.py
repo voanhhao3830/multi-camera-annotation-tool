@@ -12,7 +12,7 @@ from typing import Optional, Dict, Any, List
 
 from labelme.utils.vox_utils import vox
 from labelme.utils.constants import get_worldgrid2worldcoord_torch, DEFAULT_BEV_BOUNDS
-
+from labelme.utils.constants import DEFAULT_BEV_X, DEFAULT_BEV_Y
 
 class CameraCalibration:
     """Represents camera calibration data"""
@@ -274,9 +274,6 @@ class CameraCalibration:
         # Ensure float32
         points_3d = np.asarray(points_3d, dtype=np.float32)
         n_points = points_3d.shape[0]
-        
-        # If from_mem, apply ref_T_mem and worldgrid2worldcoord transformations
-
         
         if bev_bounds is None:
             bev_bounds = DEFAULT_BEV_BOUNDS
@@ -581,7 +578,9 @@ class CameraCalibration:
         corners_3d = np.vstack([bottom, top])  # 8x3
 
         # Project to 2D
-        corners_2d = self.project_3d_to_2d(corners_3d)
+        corners_2d = self.project_3d_to_2d(
+            corners_3d,
+        )
 
         # If all projected points are invalid, box is not visible
         if np.all(np.isnan(corners_2d)):

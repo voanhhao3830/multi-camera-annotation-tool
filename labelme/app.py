@@ -49,7 +49,8 @@ from labelme.widgets.multi_camera_canvas import MultiCameraCanvas
 from labelme.widgets.bev_canvas import BEVCanvas
 from labelme.widgets.box3d_dialog import Box3DDialog
 from labelme.utils.calibration import CameraCalibration, generate_bev_from_cameras
-
+from labelme.utils.constants import DEFAULT_BOX_SIZE, DEFAULT_BOX_WIDTH, DEFAULT_BOX_HEIGHT, DEFAULT_BOX_DEPTH
+from labelme.utils.metadata import save_metadata, load_metadata, get_bev_grid_from_metadata, get_box_size_from_metadata
 from . import utils
 
 # FIXME
@@ -2051,6 +2052,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not root_dir:
             return
         
+        # Load metadata (constants.json) to get default box sizes
+        metadata = load_metadata(root_dir)
+        default_box_width, default_box_height, default_box_depth = get_box_size_from_metadata(metadata)
+        logger.info(f"Loaded metadata: default box size = ({default_box_width}, {default_box_height}, {default_box_depth})")
+        
         # Try different frame_id formats (5-digit is most common)
         annotation_file = None
         for fmt in [f"{frame_index:05d}.json", f"{frame_index:08d}.json", f"{frame_index:04d}.json", f"{frame_index}.json"]:
@@ -2074,22 +2080,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Prioritize 'ground_points' (grid coordinates) over 'coordinates' (world coordinates)
                 ground_points = person.get("ground_points")
                 views = person.get("views", [])
+                box_3d = person.get("box_3d")  # Load 3D box metadata if available
                 
                 if person_id is None:
                     continue
                 
-                # Add point on BEV map if ground_points are valid
-                if self.bev_canvas and ground_points and len(ground_points) >= 2:
+                # Add 3D box on BEV if box_3d metadata is available
+                if self.bev_canvas and box_3d:
+                    try:
+                        # Extract 3D box parameters
+                        grid_x = box_3d.get("x", -1)
+                        grid_y = box_3d.get("y", -1)
+                        z = box_3d.get("z", 0)
+                        w = box_3d.get("w", default_box_width)
+                        h = box_3d.get("h", default_box_height)
+                        d = box_3d.get("d", default_box_depth)
+                        
+                        # Check if coordinates are valid
+                        if grid_x >= 0 and grid_y >= 0:
+                            # Transform to memory coordinates for BEV display
+                            mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                            
+                            # Create 3D box on BEV canvas
+                            # Box format: (center, size, rotation, label, group_id)
+                            center = np.array([mem_x, mem_y, z])
+                            size = np.array([w, h, d])
+                            rotation = 0.0  # Default rotation
+                            
+                            # Add box to BEV canvas
+                            self.bev_canvas.boxes_3d.append((center, size, rotation, "object", person_id))
+                            logger.info(f"Restored 3D box for person {person_id}: center=({mem_x:.1f}, {mem_y:.1f}, {z:.1f}), size=({w:.1f}, {h:.1f}, {d:.1f})")
+                            
+                    except Exception as box_e:
+                        logger.warning(f"Failed to load 3D box for person {person_id}: {box_e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                # Fall back to point if no 3D box or if box loading failed
+                elif self.bev_canvas and ground_points and len(ground_points) >= 2:
                     # ground_points are world grid coordinates (grid_x, grid_y)
                     grid_x = ground_points[0]
                     grid_y = ground_points[1]
-                    print(f"grid_x: {grid_x}, grid_y: {grid_y}")
                     # Check if ground_points are valid (positive values)
                     if grid_x >= 0 and grid_y >= 0:
                         # Transform to memory coordinates for BEV display
                         mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
                         # Add point to BEV canvas (not a box)
                         self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                        
                 # Add bounding boxes to camera views
                 for view in views:
                     view_num = view.get("viewNum", -1)
@@ -2237,6 +2275,37 @@ class MainWindow(QtWidgets.QMainWindow):
                     grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
                     persons[group_id]["ground_points"] = [grid_x, grid_y]
         
+        # Update 3D bounding box information from BEV boxes if available
+        # Store x, y, z (center position) and w, h, d (box dimensions)
+        if self.bev_canvas and self.bev_canvas.boxes_3d:
+            for box_data in self.bev_canvas.boxes_3d:
+                try:
+                    # box_data format: (center, size, rotation, label, group_id)
+                    center, size, rotation, label, group_id = box_data
+                    
+                    if group_id in persons:
+                        # Convert memory coordinates to world grid coordinates
+                        mem_x, mem_y, mem_z = center[0], center[1], center[2] if len(center) > 2 else 0
+                        grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
+                        
+                        # Store 3D box metadata
+                        persons[group_id]["box_3d"] = {
+                            "x": float(grid_x),
+                            "y": float(grid_y),
+                            "z": float(mem_z),  # z is typically in world units already
+                            "w": float(size[0]),  # width
+                            "h": float(size[1]),  # height
+                            "d": float(size[2]),  # depth
+                        }
+                        
+                        # Also update ground_points to match box center
+                        persons[group_id]["ground_points"] = [grid_x, grid_y]
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to process 3D box for group {group_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
         # Convert to list format
         annotations = list(persons.values())
         
@@ -2246,8 +2315,33 @@ class MainWindow(QtWidgets.QMainWindow):
             with open(output_file, 'w') as f:
                 json.dump(annotations, f, indent=4)
             logger.info(f"Saved global annotations: {output_file}")
+            
+            # Save metadata (constants.json) at the root directory level
+            # This includes BEV grid dimensions and default box sizes
+            if self.bev_canvas:
+                try:
+                    # Get current box size from BEV canvas
+                    current_box_size = getattr(self.bev_canvas, 'current_box_size', [DEFAULT_BOX_WIDTH, DEFAULT_BOX_HEIGHT, DEFAULT_BOX_DEPTH])
+                    
+                    save_metadata(
+                        root_dir,
+                        bev_x=self.bev_canvas.grid_width,
+                        bev_y=self.bev_canvas.grid_height,
+                        bev_z=getattr(self.bev_canvas, 'grid_depth', 2),  # Default to 2 if not set
+                        box_width=current_box_size[0],
+                        box_height=current_box_size[1],
+                        box_depth=current_box_size[2],
+                    )
+                    logger.info(f"Saved metadata to {root_dir}/constants.json")
+                except Exception as meta_e:
+                    logger.warning(f"Failed to save metadata: {meta_e}")
+                    import traceback
+                    traceback.print_exc()
+                    
         except Exception as e:
             logger.error(f"Failed to save global annotations: {e}")
+            import traceback
+            traceback.print_exc()
 
     def duplicateSelectedShape(self):
         self.copySelectedShape()
@@ -3122,6 +3216,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.is_multi_camera_mode = True
             self._aicv_root_dir = root_dir  # Store AICV root for calibration lookup
             
+            # Load metadata (constants.json) to get BEV grid dimensions and default box sizes
+            try:
+                metadata = load_metadata(root_dir)
+                bev_x, bev_y, bev_z = get_bev_grid_from_metadata(metadata)
+                box_w, box_h, box_d = get_box_size_from_metadata(metadata)
+                
+                logger.info(f"Loaded metadata: BEV grid=({bev_x}, {bev_y}, {bev_z}), box size=({box_w}, {box_h}, {box_d})")
+                
+                # Apply metadata to BEV canvas if available
+                if self.bev_canvas:
+                    self.bev_canvas.grid_width = bev_x
+                    self.bev_canvas.grid_height = bev_y
+                    self.bev_canvas.current_box_size = [box_w, box_h, box_d]
+                    self.bev_canvas.update()
+                    logger.info(f"Applied metadata to BEV canvas")
+                    
+            except Exception as meta_e:
+                logger.warning(f"Failed to load or apply metadata: {meta_e}")
+                import traceback
+                traceback.print_exc()
+            
             image_subsets_dir = osp.join(root_dir, "Image_subsets")
             subdirs = sorted([d for d in os.listdir(image_subsets_dir) if osp.isdir(osp.join(image_subsets_dir, d))])
             max_frames = 0
@@ -3810,7 +3925,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = Box3DDialog(
             self,
             x=grid_x, y=grid_y, z=0.0,
-            w=20.0, h=20.0, d=20.0,  # Default size
+            w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label="object",
             group_id=next_group_id
         )
@@ -3820,9 +3935,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
+            self._project_3d_box_to_cameras(mem_x, mem_y, new_z, new_w, new_h, new_d, new_label, new_group_id)
             
             # Add the point to BEV canvas
-            self.bev_canvas.addPoint(mem_x, mem_y, new_label, new_group_id)
+            if self.bev_canvas:
+                self.bev_canvas.addPoint(mem_x, mem_y, new_label, new_group_id)
             
             # Update ground point list
             self._update_ground_point_list()
@@ -3873,7 +3990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = Box3DDialog(
             self,
             x=grid_x, y=grid_y, z=0.0,
-            w=20.0, h=20.0, d=20.0,  # Default size
+            w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label=label,
             group_id=gid
         )

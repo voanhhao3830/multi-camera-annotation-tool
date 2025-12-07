@@ -240,8 +240,6 @@ class BEVCanvas(QtWidgets.QWidget):
             
             screen_x = grid_x * scale_x
             screen_y = grid_y * scale_y
-            print(f"canvas_width: {canvas_width}, canvas_height: {canvas_height}")
-            print(f"grid_to_screen: {grid_x}, {grid_y} -> {screen_x}, {screen_y}")
             return QPointF(screen_x, screen_y)
         except Exception as e:
             logger.error(f"Error in _grid_to_screen({grid_x}, {grid_y}): {e}")

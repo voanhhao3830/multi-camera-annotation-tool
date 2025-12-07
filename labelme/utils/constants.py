@@ -13,6 +13,16 @@ import torch
 from typing import Tuple, List
 
 # ============================================================================
+# Default 3D Box Dimensions
+# ============================================================================
+
+# Default box size (width, height, depth) in world grid units
+DEFAULT_BOX_WIDTH = 50.0  # Width of bounding box
+DEFAULT_BOX_HEIGHT = 50.0  # Height of bounding box  
+DEFAULT_BOX_DEPTH = 50.0  # Depth of bounding box
+DEFAULT_BOX_SIZE = 50.0 * 2  # Legacy: kept for backward compatibility
+
+# ============================================================================
 # World Grid to World Coordinate Transformation
 # ============================================================================
 
