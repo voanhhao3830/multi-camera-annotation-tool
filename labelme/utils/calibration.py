@@ -580,6 +580,9 @@ class CameraCalibration:
         # Project to 2D
         corners_2d = self.project_3d_to_2d(
             corners_3d,
+            bev_x=DEFAULT_BEV_X,
+            bev_y=DEFAULT_BEV_Y,
+            bev_bounds=DEFAULT_BEV_BOUNDS,
         )
 
         # If all projected points are invalid, box is not visible
