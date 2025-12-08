@@ -4314,8 +4314,16 @@ def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
     ]
     
     # Check for AICV structure first
-    if isinstance(root_dirs, str) and _detect_aicv_structure(root_dirs):
-        return _scan_aicv_camera_data(root_dirs, frame_index)
+    # Handle both string and single-element list cases
+    root_dir_to_check = None
+    if isinstance(root_dirs, str):
+        root_dir_to_check = root_dirs
+    elif isinstance(root_dirs, (list, tuple)) and len(root_dirs) == 1:
+        # If it's a list with single element, check if that element is AICV structure
+        root_dir_to_check = root_dirs[0]
+    
+    if root_dir_to_check and _detect_aicv_structure(root_dir_to_check):
+        return _scan_aicv_camera_data(root_dir_to_check, frame_index)
     
     # Resolve camera directories list
     if isinstance(root_dirs, (list, tuple)):
