@@ -4302,9 +4302,9 @@ def _scan_multi_camera_data(root_dirs, frame_index: int = 0) -> list[dict]:
     Parameters
     ----------
     root_dirs:
-        - Trường hợp cũ: một folder lớn, trong đó mỗi subfolder là một camera.
-        - Trường hợp mới: list các folder camera cụ thể (mỗi phần tử là path tới 1 camera).
-        - Trường hợp AICV: folder có cấu trúc Image_subsets + calibrations.
+        - Legacy case: a single root folder where each subfolder is one camera.
+        - New case: a list of specific camera folders (each element is a path to one camera).
+        - AICV case: a folder with `Image_subsets` + `calibrations` structure.
     """
     camera_data = []
     
