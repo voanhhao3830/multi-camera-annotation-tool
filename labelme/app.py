@@ -1890,13 +1890,17 @@ class MainWindow(QtWidgets.QMainWindow):
             
             shape = item.shape()
             if shape and shape.group_id == new_id:
-                # Update the text in label list with new_id
+                # Update the text in label list with new_id and color indicator
                 # (shape.group_id has already been updated to new_id)
                 if shape.group_id is None:
                     text = shape.label
                 else:
                     text = f"{shape.label} ({shape.group_id})"
-                item.setText(text)
+                
+                # Add color indicator dot (like in addLabel and editLabel)
+                r, g, b = shape.fill_color.getRgb()[:3]
+                text_with_color = f'{html.escape(text)} <font color="#{r:02x}{g:02x}{b:02x}">●</font>'
+                item.setText(text_with_color)
     
     def _update_person_id_in_current_frame(self, old_id: int, new_id: int):
         """Update person ID for all shapes in current frame only"""
@@ -4683,6 +4687,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bev_canvas = BEVCanvas(self)
         self.bev_canvas.setBEVParams(width=bev_width, height=bev_height, scale=bev_scale)
         
+        # Set color shift to match app config for consistent colors
+        self.bev_canvas.setColorShift(self._config["shift_auto_shape_color"])
+        
         # Set camera overlay data
         if self.camera_calibrations and self.multi_camera_data:
             self.bev_canvas.setCameraOverlay(self.camera_calibrations, self.multi_camera_data)
@@ -4841,6 +4848,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             x, y, z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            old_group_id = group_id  # Store old group_id for updating colors
             
             # Update box in BEV
             self.bev_canvas.updateBox3D(box_idx, x, y, z, new_w, new_h, new_d)
@@ -4851,17 +4859,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 center, size, rotation, _, _ = box_data
                 self.bev_canvas.boxes_3d[box_idx] = (np.array([x, y, z]), np.array([new_w, new_h, new_d]), rotation, new_label, new_group_id)
             
+            # Clear selection so box is drawn with its group_id color, not selection color
+            self.bev_canvas.selected_box_idx = None
+            
+            # If group_id changed, update colors of any non-BEV shapes with the old group_id
+            if old_group_id != new_group_id:
+                logger.info(f"3D Box: Updating group_id from {old_group_id} to {new_group_id}")
+                
+                # Update non-BEV shapes in camera views
+                if self.multi_camera_canvas:
+                    for cell in self.multi_camera_canvas.camera_cells:
+                        for shape in cell.shapes:
+                            # Update non-BEV shapes with matching group_id
+                            if shape.group_id == old_group_id and not shape.other_data.get("from_bev", False):
+                                shape.group_id = new_group_id
+                                self._update_shape_color(shape)
+                
+                # Update label list to reflect new group_id and colors
+                self._update_label_list_for_id_change(old_group_id, new_group_id)
+                
+                # Trigger BEV canvas update to ensure box color is refreshed
+                if self.bev_canvas:
+                    self.bev_canvas.update()
+            
             # Remove old projections and re-project with new size
             if not self.multi_camera_canvas or not self.multi_camera_data:
                 return
             
-            # Remove old projections (only BEV-projected boxes)
+            # Remove old projections (only BEV-projected boxes with OLD group_id)
             for idx, cam_data in enumerate(self.multi_camera_data):
                 cell = self.multi_camera_canvas.camera_cells[idx]
                 shapes_to_remove = []
                 for shape in cell.shapes:
-                    # Only remove boxes that are from BEV and match label/group_id
-                    if (shape.label == label and shape.group_id == group_id and 
+                    # Only remove boxes that are from BEV and match label/OLD group_id
+                    if (shape.label == label and shape.group_id == old_group_id and 
                         shape.other_data.get("from_bev", False)):
                         shapes_to_remove.append(shape)
                 
@@ -4969,6 +5000,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         x, y, label, gid = self.bev_canvas.points[point_idx]
+        old_group_id = gid  # Store old group_id to update 2D boxes
         
         # Convert back to grid coordinates for display
         grid_x, grid_y = self._mem_to_worldgrid(x, y)
@@ -4988,8 +5020,37 @@ class MainWindow(QtWidgets.QMainWindow):
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
             
+            # Debug logging
+            logger.info(f"Updating BEV point: old_group_id={old_group_id}, new_group_id={new_group_id}")
+            
             # Update point
             self.bev_canvas.updatePoint(point_idx, mem_x, mem_y, new_label, new_group_id)
+            
+            # Clear selection so point is drawn with its group_id color, not selection color
+            self.bev_canvas.selected_point_idx = None
+            
+            # If group_id changed, update all 2D bounding boxes with the old group_id
+            if old_group_id != new_group_id:
+                logger.info(f"Updating group_id from {old_group_id} to {new_group_id} for all 2D boxes")
+                
+                # Update 2D bounding boxes in camera views
+                if self.multi_camera_canvas:
+                    for cell in self.multi_camera_canvas.camera_cells:
+                        for shape in cell.shapes:
+                            if shape.group_id == old_group_id:
+                                shape.group_id = new_group_id
+                                # Update shape color to match new group_id
+                                self._update_shape_color(shape)
+                    
+                    # Trigger multi-camera canvas update to show new colors
+                    self.multi_camera_canvas.update()
+                
+                # Update label list to reflect new group_id and colors
+                self._update_label_list_for_id_change(old_group_id, new_group_id)
+                
+                # Trigger BEV canvas update to ensure point color is refreshed
+                if self.bev_canvas:
+                    self.bev_canvas.update()
             
             # Update ground point list
             self._update_ground_point_list()

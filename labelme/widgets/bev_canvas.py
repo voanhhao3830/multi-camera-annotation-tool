@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import imgviz
 import numpy as np
+from numpy.typing import NDArray
 from PyQt5 import QtCore
 from PyQt5 import QtGui
 from PyQt5 import QtWidgets
@@ -14,6 +16,9 @@ from loguru import logger
 
 from labelme.shape import Shape
 from labelme.utils.constants import DEFAULT_BEV_X, DEFAULT_BEV_Y
+
+# Use same color map as main app for consistency
+LABEL_COLORMAP: NDArray[np.uint8] = imgviz.label_colormap()
 
 
 class BEVCanvas(QtWidgets.QWidget):
@@ -39,6 +44,9 @@ class BEVCanvas(QtWidgets.QWidget):
         self.setMinimumSize(400, 400)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)  # Enable keyboard focus
+        
+        # Color shift for auto shape colors (must match app.py config)
+        self._shift_auto_shape_color: int = 0
         
         # BEV view settings
         # Grid dimensions from constants (pixels in grid space)
@@ -103,6 +111,37 @@ class BEVCanvas(QtWidgets.QWidget):
         """Set movement step size"""
         self.move_step = step
         self.move_step_large = step * 10.0
+    
+    def setColorShift(self, shift: int):
+        """
+        Set color shift for auto shape colors to match app.py config.
+        
+        Args:
+            shift: shift_auto_shape_color value from config
+        """
+        self._shift_auto_shape_color = shift
+        self.update()
+    
+    def _get_rgb_by_group_id(self, group_id: int) -> tuple[int, int, int]:
+        """
+        Get RGB color for a group_id using the same colormap as app.py.
+        This ensures BEV points have the same color as camera bounding boxes.
+        
+        Args:
+            group_id: Group ID for the shape
+            
+        Returns:
+            RGB tuple (r, g, b) with values 0-255
+        """
+        color_id: int = (
+            1  # skip black color by default
+            + group_id
+            + self._shift_auto_shape_color
+        )
+        rgb: tuple[int, int, int] = tuple(
+            LABEL_COLORMAP[color_id % len(LABEL_COLORMAP)].tolist()
+        )
+        return rgb
 
     def setBackgroundImage(self, image: QtGui.QImage | str, alpha: float = 0.8) -> None:
         """Set BEV background image (top-down overlay) and optional opacity."""
@@ -206,6 +245,7 @@ class BEVCanvas(QtWidgets.QWidget):
         new_label = label if label is not None else old_label
         new_gid = group_id if group_id is not None else old_gid
         
+        logger.info(f"BEV updatePoint: old_gid={old_gid}, new_gid={new_gid}, shift={self._shift_auto_shape_color}")
         self.points[point_idx] = (new_x, new_y, new_label, new_gid)
         self.update()
         return True
@@ -480,15 +520,18 @@ class BEVCanvas(QtWidgets.QWidget):
         for idx, (x, y, label, group_id) in enumerate(self.points):
             screen_pos = self._grid_to_screen(x, y)
             
-            # Determine color based on group_id for consistency
+            # Determine color based on group_id for consistency with camera views
             if group_id is not None:
-                # Use group_id to generate a consistent color
-                hue = (group_id * 67) % 360
-                color = QtGui.QColor.fromHsv(hue, 200, 255)
+                # Use same colormap as app.py for consistent colors
+                r, g, b = self._get_rgb_by_group_id(group_id)
+                color = QtGui.QColor(r, g, b)
+                # Debug: log color for first point only to avoid spam
+                # if idx == 0:
+                    # logger.debug(f"BEV paintEvent: point[{idx}] group_id={group_id}, color=RGB({r},{g},{b})")
             else:
                 color = self.box_color
             
-            # Check if selected or hovered
+            # Check if selected or hovered (override color)
             if idx == self.selected_point_idx:
                 color = self.selected_box_color
             elif idx == self.hovered_point_idx:
