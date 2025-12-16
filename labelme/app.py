@@ -23,7 +23,7 @@ from PyQt5 import QtCore
 from PyQt5 import QtGui
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QDialog
 
 from labelme import __appname__
 from labelme import __version__
@@ -48,6 +48,7 @@ from labelme.widgets import ZoomWidget
 from labelme.widgets.multi_camera_canvas import MultiCameraCanvas
 from labelme.widgets.bev_canvas import BEVCanvas
 from labelme.widgets.box3d_dialog import Box3DDialog
+from labelme.widgets.preprocess_dialog import PreprocessDialog
 from labelme.utils.calibration import CameraCalibration, generate_bev_from_cameras
 from labelme.utils.constants import DEFAULT_BOX_SIZE, DEFAULT_BOX_WIDTH, DEFAULT_BOX_HEIGHT, DEFAULT_BOX_DEPTH
 from labelme.utils.metadata import save_metadata, load_metadata, get_bev_grid_from_metadata, get_box_size_from_metadata
@@ -181,6 +182,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ground_point_widget.setMouseTracking(True)
         self.ground_point_widget.installEventFilter(self)  # For Delete key handling
         self.ground_point_dock.setWidget(self.ground_point_widget)
+        
+        # Track currently hovered item to clear highlight when leaving
+        self._current_hovered_group_id = None
         
         # Keep flag_widget reference for compatibility but point to ground point widget
         self.flag_dock = self.ground_point_dock
@@ -908,6 +912,15 @@ class MainWindow(QtWidgets.QMainWindow):
         # ai_prompt_action = QtWidgets.QWidgetAction(self)
         # ai_prompt_action.setDefaultWidget(self._ai_prompt_widget)
 
+        # Preprocessing action
+        preprocessAction = action(
+            self.tr("Preprocessing"),
+            self.runPreprocessing,
+            None,
+            icon="settings.svg",
+            tip=self.tr("Run preprocessing to assign consistent IDs across frames"),
+        )
+        
         self.addToolBar(
             Qt.TopToolBarArea,
             ToolBar(
@@ -919,6 +932,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     openNextImg,
                     save,
                     deleteFile,
+                    None,
+                    preprocessAction,
                     None,
                     editMode,
                     duplicate,
@@ -1781,21 +1796,181 @@ class MainWindow(QtWidgets.QMainWindow):
         return success
 
     def eventFilter(self, obj, event):
-        """Handle Delete key press in ground point widget"""
-        if obj == self.ground_point_widget and event.type() == QtCore.QEvent.KeyPress:
-            if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-                current_item = self.ground_point_widget.currentItem()
-                if current_item:
-                    group_id = current_item.data(Qt.UserRole)
-                    self._delete_ground_point(group_id)
-                    return True
+        """Handle Delete key press in ground point widget and mouse leave events"""
+        if obj == self.ground_point_widget:
+            if event.type() == QtCore.QEvent.KeyPress:
+                if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                    current_item = self.ground_point_widget.currentItem()
+                    if current_item:
+                        group_id = current_item.data(Qt.UserRole)
+                        self._delete_ground_point(group_id)
+                        return True
+            elif event.type() == QtCore.QEvent.Leave:
+                # Clear highlight when mouse leaves the widget
+                if self._current_hovered_group_id is not None:
+                    self._highlight_shapes_by_group_id(self._current_hovered_group_id, highlight=False)
+                    self._current_hovered_group_id = None
+                    if self.multi_camera_canvas:
+                        self.multi_camera_canvas.update()
         return super().eventFilter(obj, event)
     
     def _ground_point_double_clicked(self, item):
-        """Handle double-click on ground point to delete it"""
-        if item:
-            group_id = item.data(Qt.UserRole)
-            self._delete_ground_point(group_id)
+        """Handle double-click on ground point to edit ID"""
+        if not item:
+            return
+        
+        group_id = item.data(Qt.UserRole)
+        if group_id is None:
+            return
+        
+        # Show input dialog to edit ID
+        current_id = int(group_id)
+        new_id, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Edit Person ID",
+            f"Enter new ID for person (current: {current_id}):",
+            value=current_id,
+            min=0,
+            max=9999
+        )
+        
+        if not ok or new_id == current_id:
+            return
+        
+        # Update ID for all shapes with this group_id in current frame
+        self._update_person_id_in_current_frame(current_id, new_id)
+        
+        # Update BEV canvas
+        if self.bev_canvas:
+            # Update point group_id
+            for i, (mem_x, mem_y, label, gid) in enumerate(self.bev_canvas.points):
+                if gid == current_id:
+                    self.bev_canvas.points[i] = (mem_x, mem_y, label, new_id)
+            
+            # Update 3D boxes group_id
+            for i, box_data in enumerate(self.bev_canvas.boxes_3d):
+                center, size, rotation, label, gid = box_data
+                if gid == current_id:
+                    self.bev_canvas.boxes_3d[i] = (center, size, rotation, label, new_id)
+            
+            self.bev_canvas.update()
+        
+        # Update multi-camera canvas shapes
+        if self.multi_camera_canvas:
+            for cell in self.multi_camera_canvas.camera_cells:
+                for shape in cell.shapes:
+                    if shape.group_id == current_id:
+                        shape.group_id = new_id
+            self.multi_camera_canvas.update()
+        
+        # Update label list items
+        self._update_label_list_for_id_change(current_id, new_id)
+        
+        # Update annotations in memory
+        self._update_person_id_in_annotations(current_id, new_id)
+        
+        # Refresh ground point list
+        self._update_ground_point_list()
+        
+        # Mark as dirty to prompt save
+        self.setDirty()
+    
+    def _update_label_list_for_id_change(self, old_id: int, new_id: int):
+        """Update label list items when person ID changes"""
+        if not self.labelList:
+            return
+        
+        # Find all label list items with shapes that have the old_id
+        # Note: shapes have already been updated to new_id in _update_person_id_in_current_frame
+        # So we need to find by checking if the item text contains the old_id, or iterate through all
+        for i in range(self.labelList._model.rowCount()):
+            item = self.labelList._model.item(i)
+            if item is None:
+                continue
+            
+            shape = item.shape()
+            if shape and shape.group_id == new_id:
+                # Update the text in label list with new_id
+                # (shape.group_id has already been updated to new_id)
+                if shape.group_id is None:
+                    text = shape.label
+                else:
+                    text = f"{shape.label} ({shape.group_id})"
+                item.setText(text)
+    
+    def _update_person_id_in_current_frame(self, old_id: int, new_id: int):
+        """Update person ID for all shapes in current frame only"""
+        if not self.multi_camera_canvas:
+            return
+        
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                if shape.group_id == old_id:
+                    shape.group_id = new_id
+    
+    def _update_person_id_in_annotations(self, old_id: int, new_id: int):
+        """Update person ID in annotation file for current frame"""
+        if not self.filename:
+            return
+        
+        # Get current frame index
+        try:
+            if self.filename.startswith("Frame_"):
+                frame_index = int(self.filename.split("_")[1])
+            else:
+                return
+        except (ValueError, IndexError):
+            return
+        
+        # Find annotation file
+        root_dir = None
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+            root_dir = osp.dirname(self._multi_camera_root_dirs[0])
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        
+        if not root_dir:
+            return
+        
+        annotation_dir = osp.join(root_dir, "annotations_positions")
+        if not osp.exists(annotation_dir):
+            return
+        
+        # Find annotation file
+        annotation_file = None
+        for fmt in [f"{frame_index:05d}.json", f"{frame_index:08d}.json", f"{frame_index:04d}.json", f"{frame_index}.json"]:
+            candidate = osp.join(annotation_dir, fmt)
+            if osp.exists(candidate):
+                annotation_file = candidate
+                break
+        
+        if not annotation_file:
+            return
+        
+        # Load and update annotations
+        try:
+            import json
+            with open(annotation_file, 'r') as f:
+                annotations = json.load(f)
+            
+            # Update personID in annotations
+            updated = False
+            for person in annotations:
+                if person.get("personID") == old_id:
+                    person["personID"] = new_id
+                    updated = True
+            
+            # Save updated annotations
+            if updated:
+                with open(annotation_file, 'w') as f:
+                    json.dump(annotations, f, indent=4)
+                logger.info(f"Updated person ID from {old_id} to {new_id} in {annotation_file}")
+        except Exception as e:
+            logger.error(f"Failed to update person ID in annotations: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _ground_point_context_menu(self, point):
         """Show context menu for ground point (BEV point)"""
@@ -1811,16 +1986,33 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _ground_point_hover(self, item):
         """Highlight bounding boxes when hovering over ground point"""
-        if not item or not self.multi_camera_canvas:
+        if not self.multi_camera_canvas:
             return
         
-        group_id = item.data(Qt.UserRole)
-        self._highlight_shapes_by_group_id(group_id, highlight=True)
+        # Clear highlight of previous item if exists
+        if self._current_hovered_group_id is not None:
+            self._highlight_shapes_by_group_id(self._current_hovered_group_id, highlight=False)
+            self._current_hovered_group_id = None
+        
+        # Highlight new item if exists
+        if item:
+            group_id = item.data(Qt.UserRole)
+            if group_id is not None:
+                self._highlight_shapes_by_group_id(group_id, highlight=True)
+                self._current_hovered_group_id = group_id
+        
+        # Update canvas to show changes
+        self.multi_camera_canvas.update()
     
     def _ground_point_selection_changed(self):
         """Highlight bounding boxes when ground point is selected"""
         if not self.multi_camera_canvas:
             return
+        
+        # Clear hover highlight when selection changes
+        if self._current_hovered_group_id is not None:
+            self._highlight_shapes_by_group_id(self._current_hovered_group_id, highlight=False)
+            self._current_hovered_group_id = None
         
         # Clear all highlights first
         for cell in self.multi_camera_canvas.camera_cells:
@@ -1832,7 +2024,8 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_items = self.ground_point_widget.selectedItems()
         if selected_items:
             group_id = selected_items[0].data(Qt.UserRole)
-            self._highlight_shapes_by_group_id(group_id, highlight=True)
+            if group_id is not None:
+                self._highlight_shapes_by_group_id(group_id, highlight=True)
         
         self.multi_camera_canvas.update()
     
@@ -2085,6 +2278,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if person_id is None:
                     continue
                 
+                # Track if point was added to BEV (point is required for centroid)
+                point_added_to_bev = False
+                
                 # Add 3D box on BEV if box_3d metadata is available
                 if self.bev_canvas and box_3d:
                     try:
@@ -2111,22 +2307,79 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.bev_canvas.boxes_3d.append((center, size, rotation, "object", person_id))
                             logger.info(f"Restored 3D box for person {person_id}: center=({mem_x:.1f}, {mem_y:.1f}, {z:.1f}), size=({w:.1f}, {h:.1f}, {d:.1f})")
                             
+                            # IMPORTANT: Also add point (centroid) for this person
+                            # Point represents the centroid of the cluster, which is required
+                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                            point_added_to_bev = True
+                            
                     except Exception as box_e:
                         logger.warning(f"Failed to load 3D box for person {person_id}: {box_e}")
                         import traceback
                         traceback.print_exc()
                 
-                # Fall back to point if no 3D box or if box loading failed
-                elif self.bev_canvas and ground_points and len(ground_points) >= 2:
-                    # ground_points are world grid coordinates (grid_x, grid_y)
-                    grid_x = ground_points[0]
-                    grid_y = ground_points[1]
-                    # Check if ground_points are valid (positive values)
-                    if grid_x >= 0 and grid_y >= 0:
-                        # Transform to memory coordinates for BEV display
-                        mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
-                        # Add point to BEV canvas (not a box)
-                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                # Add point (centroid) if not already added
+                # Point is required for each person as it represents the centroid of the cluster
+                if self.bev_canvas and not point_added_to_bev:
+                    if ground_points and len(ground_points) >= 2:
+                        # ground_points are world grid coordinates (grid_x, grid_y)
+                        grid_x = ground_points[0]
+                        grid_y = ground_points[1]
+                        # Check if ground_points are valid (positive values)
+                        if grid_x >= 0 and grid_y >= 0:
+                            # Transform to memory coordinates for BEV display
+                            mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                            # Add point to BEV canvas (not a box)
+                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                            point_added_to_bev = True
+                    
+                    # If still no point added, try to compute from views or use default position
+                    if not point_added_to_bev:
+                        # Try to compute BEV position from first valid view
+                        for view in views:
+                            view_num = view.get("viewNum", -1)
+                            xmin = view.get("xmin", -1)
+                            ymin = view.get("ymin", -1)
+                            xmax = view.get("xmax", -1)
+                            ymax = view.get("ymax", -1)
+                            
+                            if xmin >= 0 and ymin >= 0 and xmax >= 0 and ymax >= 0:
+                                # Try to project bbox to BEV
+                                try:
+                                    from labelme.utils.project_bev import convert_bbox_to_bev
+                                    # VIEW_TO_CAMERA mapping: viewNum (1-indexed) -> camera name
+                                    VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+                                    camera_name = VIEW_TO_CAMERA.get(view_num)
+                                    if camera_name:
+                                        bbox = [xmin, ymin, xmax, ymax]
+                                        # Find calibration folder
+                                        root_dir = None
+                                        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                                            root_dir = self._aicv_root_dir
+                                        elif self._prev_opened_dir:
+                                            root_dir = self._prev_opened_dir
+                                        
+                                        if root_dir:
+                                            calib_folder = osp.join(root_dir, "calibrations")
+                                            if osp.exists(calib_folder):
+                                                bev_coords = convert_bbox_to_bev(
+                                                    camera_name, bbox, calib_folder, z_world=0.0
+                                                )
+                                                if bev_coords:
+                                                    mem_x, mem_y = bev_coords
+                                                    self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                                    point_added_to_bev = True
+                                                    logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
+                                                    break
+                                except Exception as e:
+                                    logger.debug(f"Failed to compute BEV from view {view_num}: {e}")
+                        
+                        # If still no point, add a default point at center (will be updated later)
+                        if not point_added_to_bev:
+                            # Use center of BEV canvas as default
+                            default_x = self._bev_x / 2.0 if hasattr(self, '_bev_x') else 600.0
+                            default_y = self._bev_y / 2.0 if hasattr(self, '_bev_y') else 400.0
+                            self.bev_canvas.addPoint(default_x, default_y, "object", person_id)
+                            logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
                         
                 # Add bounding boxes to camera views
                 for view in views:
@@ -2342,6 +2595,740 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.error(f"Failed to save global annotations: {e}")
             import traceback
             traceback.print_exc()
+
+    def runPreprocessing(self):
+        """Run preprocessing to assign consistent IDs across frames"""
+        if not self.is_multi_camera_mode or not hasattr(self, "_aicv_root_dir") or not self._aicv_root_dir:
+            QMessageBox.warning(
+                self,
+                "Preprocessing",
+                "Preprocessing is only available in multi-camera mode with AICV structure."
+            )
+            return
+        
+        # Show settings dialog
+        # Calculate max_frames before showing dialog
+        # Try to get frame count from annotations or images
+        max_frames = 0
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+            root_dir = osp.dirname(self._multi_camera_root_dirs[0])
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        else:
+            root_dir = None
+        
+        if root_dir:
+            import glob
+            annotations_folder = osp.join(root_dir, "annotations_positions")
+            image_subsets_folder = osp.join(root_dir, "Image_subsets")
+            
+            # Try to get frame count from annotations
+            if osp.exists(annotations_folder):
+                annotation_files = sorted(glob.glob(osp.join(annotations_folder, "*.json")))
+                max_frames = len(annotation_files)
+            
+            # If no annotations, try to get from images
+            if max_frames == 0 and osp.exists(image_subsets_folder):
+                camera_folders = sorted([d for d in os.listdir(image_subsets_folder)
+                                       if osp.isdir(osp.join(image_subsets_folder, d))])
+                for cam_folder in camera_folders:
+                    cam_path = osp.join(image_subsets_folder, cam_folder)
+                    if osp.isdir(cam_path):
+                        image_files = glob.glob(osp.join(cam_path, "*.jpg")) + \
+                                     glob.glob(osp.join(cam_path, "*.png")) + \
+                                     glob.glob(osp.join(cam_path, "*.jpeg"))
+                        max_frames = max(max_frames, len(image_files))
+        
+        dialog = PreprocessDialog(self, max_frames=max_frames)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        settings = dialog.get_settings()
+        
+        # Show progress dialog
+        progress = QtWidgets.QProgressDialog("Running preprocessing...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        
+        try:
+            # os, json, glob already imported at top of file
+            import tempfile
+            import shutil
+            from labelme.utils.preprocess_label import PreprocessLabel
+            
+            root_dir = self._aicv_root_dir
+            image_subsets_folder = os.path.join(root_dir, "Image_subsets")
+            annotations_folder = os.path.join(root_dir, "annotations_positions")
+            calibrations_root = os.path.join(root_dir, "calibrations")
+            
+            # Check required folders
+            missing_folders = []
+            if not os.path.exists(image_subsets_folder):
+                missing_folders.append(f"Image_subsets ({image_subsets_folder})")
+            
+            # Create annotations_positions folder if it doesn't exist
+            if not os.path.exists(annotations_folder):
+                try:
+                    os.makedirs(annotations_folder, exist_ok=True)
+                    logger.info(f"Created annotations_positions folder: {annotations_folder}")
+                except Exception as e:
+                    missing_folders.append(f"annotations_positions ({annotations_folder}) - Cannot create: {str(e)}")
+            
+            if missing_folders:
+                QMessageBox.warning(
+                    self,
+                    "Preprocessing",
+                    f"Required folders not found:\n\n" + "\n".join(f"- {folder}" for folder in missing_folders) +
+                    f"\n\nPlease ensure these folders exist in:\n{root_dir}"
+                )
+                return
+            
+            progress.setValue(10)
+            QtWidgets.QApplication.processEvents()
+            
+            # Get camera folders
+            camera_folders = sorted([d for d in os.listdir(image_subsets_folder)
+                                   if os.path.isdir(os.path.join(image_subsets_folder, d))])
+            camera_names = [f"Camera{i}" for i in range(1, 7) if str(i) in camera_folders]
+            
+            if not camera_names:
+                QMessageBox.warning(self, "Preprocessing", "No camera folders found.")
+                return
+            
+            # Load calibrations to temp folder
+            progress.setValue(20)
+            QtWidgets.QApplication.processEvents()
+            
+            temp_calib_folder = tempfile.mkdtemp(prefix="multicam_calib_")
+            intrinsic_folder = os.path.join(temp_calib_folder, "intrinsic")
+            extrinsic_folder = os.path.join(temp_calib_folder, "extrinsic")
+            os.makedirs(intrinsic_folder, exist_ok=True)
+            os.makedirs(extrinsic_folder, exist_ok=True)
+            
+            for cam_name in camera_names:
+                cam_root = os.path.join(calibrations_root, cam_name, "calibrations")
+                if not os.path.exists(cam_root):
+                    continue
+                
+                # Find intrinsic subfolder
+                intrinsic_subfolder = None
+                for subfolder_name in ["intrinsic_original", "intrinsic_optimal", "intrinsic"]:
+                    test_path = os.path.join(cam_root, subfolder_name)
+                    if os.path.exists(test_path):
+                        intrinsic_subfolder = test_path
+                        break
+                
+                extrinsic_subfolder = os.path.join(cam_root, "extrinsic")
+                
+                if not intrinsic_subfolder or not os.path.exists(extrinsic_subfolder):
+                    continue
+                
+                intrinsic_files = glob.glob(os.path.join(intrinsic_subfolder, f"intr_{cam_name}.xml"))
+                extrinsic_files = glob.glob(os.path.join(extrinsic_subfolder, f"extr_{cam_name}.xml"))
+                
+                if not intrinsic_files or not extrinsic_files:
+                    all_intrinsic = glob.glob(os.path.join(intrinsic_subfolder, "*.xml"))
+                    all_extrinsic = glob.glob(os.path.join(extrinsic_subfolder, "*.xml"))
+                    if all_intrinsic and all_extrinsic:
+                        intrinsic_files = [all_intrinsic[0]]
+                        extrinsic_files = [all_extrinsic[0]]
+                    else:
+                        continue
+                
+                dest_intr = os.path.join(intrinsic_folder, f"intr_{cam_name}.xml")
+                dest_extr = os.path.join(extrinsic_folder, f"extr_{cam_name}.xml")
+                shutil.copy2(intrinsic_files[0], dest_intr)
+                shutil.copy2(extrinsic_files[0], dest_extr)
+            
+            progress.setValue(30)
+            QtWidgets.QApplication.processEvents()
+            
+            # Check how many frames are available from images
+            # Get max frames from Image_subsets
+            max_frames_from_images = 0
+            if os.path.exists(image_subsets_folder):
+                for cam_folder in camera_folders:
+                    cam_path = os.path.join(image_subsets_folder, cam_folder)
+                    if os.path.isdir(cam_path):
+                        image_files = glob.glob(os.path.join(cam_path, "*.jpg")) + \
+                                     glob.glob(os.path.join(cam_path, "*.png")) + \
+                                     glob.glob(os.path.join(cam_path, "*.jpeg"))
+                        max_frames_from_images = max(max_frames_from_images, len(image_files))
+            
+            # Load all annotations
+            annotation_files = sorted(glob.glob(os.path.join(annotations_folder, "*.json")))
+            total_frames = len(annotation_files)
+            
+            # If no annotation files exist, create empty ones for all frames
+            if total_frames == 0:
+                if max_frames_from_images > 0:
+                    progress.setValue(35)
+                    QtWidgets.QApplication.processEvents()
+                    
+                    logger.info(f"Creating {max_frames_from_images} empty annotation files...")
+                    saved_count = 0
+                    for frame_idx in range(max_frames_from_images):
+                        frame_id = f"{frame_idx:05d}"
+                        annot_file = os.path.join(annotations_folder, f"{frame_id}.json")
+                        
+                        if not os.path.exists(annot_file):
+                            with open(annot_file, 'w') as f:
+                                json.dump([], f)
+                            saved_count += 1
+                    
+                    logger.info(f"Created {saved_count} empty annotation files")
+                    
+                    # Reload annotation files
+                    annotation_files = sorted(glob.glob(os.path.join(annotations_folder, "*.json")))
+                    total_frames = len(annotation_files)
+                else:
+                    QMessageBox.warning(
+                        self, 
+                        "Preprocessing", 
+                        f"No frames found in Image_subsets folder.\n"
+                        f"Please ensure images exist in:\n{image_subsets_folder}"
+                    )
+                    return
+            
+            # Apply frame range
+            # start_frame: specific index (default 0)
+            # end_frame: specific index (default last frame)
+            # Store original frame count before slicing
+            original_total_frames = len(annotation_files)
+            start_frame = settings.get("start_frame", 0)
+            end_frame = settings.get("end_frame", original_total_frames)
+            
+            # Clamp values to valid range
+            start_frame = max(0, min(start_frame, original_total_frames - 1))
+            end_frame = max(start_frame + 1, min(end_frame, original_total_frames))
+            
+            # Apply frame range: [start_frame, end_frame)
+            annotation_files = annotation_files[start_frame:end_frame]
+            
+            frame_count = len(annotation_files)
+            
+            all_annotations = []
+            for annot_file in annotation_files:
+                try:
+                    with open(annot_file, "r") as f:
+                        data = json.load(f)
+                        all_annotations.append(data)
+                except:
+                    all_annotations.append([])
+            
+            progress.setValue(40)
+            QtWidgets.QApplication.processEvents()
+            
+            # Convert annotations to detection format (same logic as test_process_label.py)
+            VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+            multi_camera_detections = {cam: [] for cam in camera_names}
+            annotation_to_local_id_map = {}  # Map from annotation to local_id: {(frame_idx, cam_name, person_idx, view_idx): local_id}
+            
+            total_detections = 0
+            frames_with_detections = 0
+            
+            for frame_idx in range(frame_count):
+                frame_data = all_annotations[frame_idx]
+                frame_bboxes = {cam: [] for cam in camera_names}
+                local_id_counters = {cam: 0 for cam in camera_names}  # Track local_id per camera
+                
+                # Check if frame has any annotations
+                if isinstance(frame_data, list) and len(frame_data) > 0:
+                    for person_idx, person in enumerate(frame_data):
+                        if not isinstance(person, dict):
+                            continue
+                        for view_idx, view in enumerate(person.get("views", [])):
+                            if not isinstance(view, dict):
+                                continue
+                            if view.get("xmin") == -1:
+                                continue
+                            
+                            view_num = view.get("viewNum")
+                            cam_name = VIEW_TO_CAMERA.get(view_num)
+                            
+                            if cam_name and cam_name in frame_bboxes:
+                                try:
+                                    xmin = int(view["xmin"])
+                                    ymin = int(view["ymin"])
+                                    xmax = int(view["xmax"])
+                                    ymax = int(view["ymax"])
+                                    # Validate bbox
+                                    if xmin >= 0 and ymin >= 0 and xmax > xmin and ymax > ymin:
+                                        frame_bboxes[cam_name].append([xmin, ymin, xmax, ymax])
+                                        
+                                        # Map annotation to local_id (same as test_process_label.py)
+                                        local_id = local_id_counters[cam_name]
+                                        annotation_to_local_id_map[(frame_idx, cam_name, person_idx, view_idx)] = local_id
+                                        local_id_counters[cam_name] += 1
+                                        
+                                        total_detections += 1
+                                except (ValueError, KeyError, TypeError):
+                                    continue
+                    
+                    if any(len(bboxes) > 0 for bboxes in frame_bboxes.values()):
+                        frames_with_detections += 1
+                
+                for cam_name in camera_names:
+                    multi_camera_detections[cam_name].append(frame_bboxes.get(cam_name, []))
+            
+            # Check if we have any detections
+            # If no detections and model path is provided, automatically run YOLO detection first
+            if total_detections == 0:
+                model_path = settings.get("model_path")
+                if model_path and os.path.exists(model_path):
+                    # Automatically run YOLO detection to create annotations
+                    logger.info(f"No detections found. Running YOLO detection using model: {model_path}")
+                    progress.setValue(45)
+                    QtWidgets.QApplication.processEvents()
+                    
+                    # Run YOLO detection
+                    try:
+                        from ultralytics import YOLO
+                        import cv2
+                        
+                        logger.info(f"Loading YOLO model from {model_path}")
+                        yolo_model = YOLO(model_path)
+                        
+                        # Helper function to convert camera_id to viewNum
+                        def camera_id_to_view_num(camera_id):
+                            # Camera1 -> 1, Camera2 -> 2, etc.
+                            try:
+                                return int(camera_id.replace("Camera", ""))
+                            except:
+                                return None
+                        
+                        # Process each frame
+                        # frame_idx is relative to sliced range (0 to frame_count-1)
+                        # actual_frame_idx is absolute index in original annotation files (start_frame to end_frame-1)
+                        detections_created = 0
+                        for frame_idx in range(frame_count):
+                            actual_frame_idx = start_frame + frame_idx
+                            if frame_idx % 10 == 0:
+                                # YOLO detection: 45-70 (25% range)
+                                progress.setValue(45 + int(25 * frame_idx / frame_count))
+                                QtWidgets.QApplication.processEvents()
+                            
+                            frame_detections_dict = {}
+                            camera_data_for_frame = []
+                            
+                            # Load images from all cameras for this frame
+                            for cam_folder in camera_folders:
+                                cam_path = os.path.join(image_subsets_folder, cam_folder)
+                                if os.path.isdir(cam_path):
+                                    image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
+                                                       glob.glob(os.path.join(cam_path, "*.png")) + 
+                                                       glob.glob(os.path.join(cam_path, "*.jpeg")))
+                                    if actual_frame_idx < len(image_files):
+                                        image_path = image_files[actual_frame_idx]
+                                        camera_id = f"Camera{cam_folder}"
+                                        
+                                        # Load image and run YOLO
+                                        image = cv2.imread(image_path)
+                                        if image is not None:
+                                            # Use conf_threshold from settings
+                                            conf_threshold = settings.get("conf_threshold", 0.5)
+                                            results = yolo_model(image, verbose=False, conf=conf_threshold)
+                                            
+                                            # Extract detections
+                                            detections = []
+                                            for result in results:
+                                                boxes = result.boxes
+                                                for box in boxes:
+                                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                                    detections.append({
+                                                        "xmin": int(x1),
+                                                        "ymin": int(y1),
+                                                        "xmax": int(x2),
+                                                        "ymax": int(y2),
+                                                        "confidence": float(box.conf[0].cpu().numpy()),
+                                                        "class": int(box.cls[0].cpu().numpy())
+                                                    })
+                                            
+                                            frame_detections_dict[camera_id] = detections
+                                            camera_data_for_frame.append({
+                                                "camera_id": camera_id,
+                                                "image_path": image_path
+                                            })
+                            
+                            # Save detections to annotation file
+                            if frame_detections_dict:
+                                # Build camera to viewNum mapping
+                                camera_to_view = {}
+                                for cam_data in camera_data_for_frame:
+                                    camera_id = cam_data["camera_id"]
+                                    view_num = camera_id_to_view_num(camera_id)
+                                    if view_num:
+                                        camera_to_view[camera_id] = view_num
+                                
+                                max_view_num = max(camera_to_view.values()) if camera_to_view else 0
+                                
+                                if max_view_num > 0:
+                                    persons = []
+                                    person_id = 0
+                                    
+                                    # Create a person for each detection
+                                    for camera_id, detections in frame_detections_dict.items():
+                                        view_num = camera_to_view.get(camera_id)
+                                        if view_num is None:
+                                            continue
+                                        
+                                        for detection in detections:
+                                            person = {
+                                                "personID": person_id,
+                                                "ground_points": [-1, -1],
+                                                "views": []
+                                            }
+                                            
+                                            # Initialize all views with -1
+                                            for v in range(1, max_view_num + 1):
+                                                person["views"].append({
+                                                    "viewNum": v,
+                                                    "xmin": -1,
+                                                    "ymin": -1,
+                                                    "xmax": -1,
+                                                    "ymax": -1
+                                                })
+                                            
+                                            # Update the view for this camera
+                                            person["views"][view_num - 1] = {
+                                                "viewNum": view_num,
+                                                "xmin": detection["xmin"],
+                                                "ymin": detection["ymin"],
+                                                "xmax": detection["xmax"],
+                                                "ymax": detection["ymax"]
+                                            }
+                                            
+                                            persons.append(person)
+                                            person_id += 1
+                                    
+                                    # Save to annotation file
+                                    # Use actual_frame_idx (absolute index) for file naming
+                                    frame_id = f"{actual_frame_idx:05d}"
+                                    annot_file = os.path.join(annotations_folder, f"{frame_id}.json")
+                                    # Convert numpy types to Python native types for JSON serialization
+                                    def convert_to_native(obj):
+                                        """Recursively convert numpy types to Python native types"""
+                                        if isinstance(obj, np.integer):
+                                            return int(obj)
+                                        elif isinstance(obj, np.floating):
+                                            return float(obj)
+                                        elif isinstance(obj, np.ndarray):
+                                            return obj.tolist()
+                                        elif isinstance(obj, dict):
+                                            return {key: convert_to_native(value) for key, value in obj.items()}
+                                        elif isinstance(obj, list):
+                                            return [convert_to_native(item) for item in obj]
+                                        return obj
+                                    
+                                    persons_serializable = convert_to_native(persons)
+                                    with open(annot_file, 'w') as f:
+                                        json.dump(persons_serializable, f, indent=4)
+                                    
+                                    if len(persons) > 0:
+                                        detections_created += 1
+                        
+                        logger.info(f"Created detections for {detections_created} frames using YOLO")
+                        
+                        # Reload annotations after YOLO detection
+                        all_annotation_files = sorted(glob.glob(os.path.join(annotations_folder, "*.json")))
+                        
+                        # Apply frame range again (start_frame and end_frame were saved from before)
+                        # Clamp values to valid range based on new total
+                        new_total_frames = len(all_annotation_files)
+                        start_frame_clamped = max(0, min(start_frame, new_total_frames - 1))
+                        end_frame_clamped = max(start_frame_clamped + 1, min(end_frame, new_total_frames))
+                        
+                        # Apply frame range: [start_frame, end_frame)
+                        annotation_files = all_annotation_files[start_frame_clamped:end_frame_clamped]
+                        frame_count = len(annotation_files)
+                        
+                        all_annotations = []
+                        for annot_file in annotation_files:
+                            try:
+                                with open(annot_file, "r") as f:
+                                    data = json.load(f)
+                                    all_annotations.append(data)
+                            except:
+                                all_annotations.append([])
+                        
+                        # Reconvert to detections and rebuild annotation_to_local_id_map (same as initial conversion)
+                        # Note: frame_idx here is relative to the sliced range (0 to frame_count-1)
+                        multi_camera_detections = {cam: [] for cam in camera_names}
+                        annotation_to_local_id_map = {}
+                        total_detections = 0
+                        
+                        for frame_idx in range(frame_count):
+                            frame_data = all_annotations[frame_idx]
+                            frame_bboxes = {cam: [] for cam in camera_names}
+                            local_id_counters = {cam: 0 for cam in camera_names}
+                            
+                            if isinstance(frame_data, list) and len(frame_data) > 0:
+                                for person_idx, person in enumerate(frame_data):
+                                    if not isinstance(person, dict):
+                                        continue
+                                    for view_idx, view in enumerate(person.get("views", [])):
+                                        if not isinstance(view, dict):
+                                            continue
+                                        if view.get("xmin") == -1:
+                                            continue
+                                        
+                                        view_num = view.get("viewNum")
+                                        cam_name = VIEW_TO_CAMERA.get(view_num)
+                                        
+                                        if cam_name and cam_name in frame_bboxes:
+                                            try:
+                                                xmin = int(view["xmin"])
+                                                ymin = int(view["ymin"])
+                                                xmax = int(view["xmax"])
+                                                ymax = int(view["ymax"])
+                                                if xmin >= 0 and ymin >= 0 and xmax > xmin and ymax > ymin:
+                                                    frame_bboxes[cam_name].append([xmin, ymin, xmax, ymax])
+                                                    
+                                                    local_id = local_id_counters[cam_name]
+                                                    annotation_to_local_id_map[(frame_idx, cam_name, person_idx, view_idx)] = local_id
+                                                    local_id_counters[cam_name] += 1
+                                                    total_detections += 1
+                                            except (ValueError, KeyError, TypeError):
+                                                continue
+                            
+                            for cam_name in camera_names:
+                                multi_camera_detections[cam_name].append(frame_bboxes.get(cam_name, []))
+                        
+                        if total_detections == 0:
+                            QMessageBox.warning(
+                                self,
+                                "Preprocessing",
+                                "YOLO detection completed but no detections were found.\n\n"
+                                "Please check your model and images."
+                            )
+                            shutil.rmtree(temp_calib_folder, ignore_errors=True)
+                            return
+                        
+                        logger.info(f"Found {total_detections} detections after YOLO detection")
+                        progress.setValue(70)
+                        QtWidgets.QApplication.processEvents()
+                    except Exception as e:
+                        logger.error(f"YOLO detection failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        QMessageBox.critical(
+                            self,
+                            "YOLO Detection Error",
+                            f"Failed to run YOLO detection:\n{str(e)}"
+                        )
+                        shutil.rmtree(temp_calib_folder, ignore_errors=True)
+                        return
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Preprocessing",
+                        f"No detections found in annotations.\n\n"
+                        f"Processed {frame_count} frames, but all annotations are empty.\n\n"
+                        "Please provide a model path in settings to run automatic detection,\n"
+                        "or annotate at least some frames manually before running preprocessing."
+                    )
+                    shutil.rmtree(temp_calib_folder, ignore_errors=True)
+                    return
+            
+            logger.info(f"Found {total_detections} detections across {frames_with_detections} frames")
+            
+            # If we didn't run YOLO, set progress to 50 (detections already existed)
+            # If we ran YOLO, progress is already at 70
+            if total_detections > 0 and progress.value() < 70:
+                progress.setValue(50)
+                QtWidgets.QApplication.processEvents()
+            
+            # Run PreprocessLabel
+            # Use default values for tracking parameters
+            preprocessor = PreprocessLabel(
+                calib_folder=temp_calib_folder,
+                max_distance_multiview=2.0,
+                max_distance_tracking=50.0,  # Default value
+                n_clusters=10,  # Default value
+                max_centroid_movement=5.0,  # Default value
+                smoothing_factor=0.3  # Default value
+            )
+            
+            # Preprocessing: 70-85 (or 50-85 if no YOLO)
+            current_progress = progress.value()
+            progress.setValue(current_progress + 5)
+            QtWidgets.QApplication.processEvents()
+            
+            global_id_map = preprocessor.preprocess(multi_camera_detections)
+            
+            progress.setValue(85)
+            QtWidgets.QApplication.processEvents()
+            
+            # Convert results back to labelme format and save
+            # global_id_map: {(frame_idx, camera_name, local_id): final_global_id}
+            # annotation_to_local_id_map: {(frame_idx, cam_name, person_idx, view_idx): local_id}
+            # We need to update annotations with new personID (same logic as test_process_label.py)
+            
+            # Map each person to its final_global_id based on annotation_to_local_id_map
+            # IMPORTANT: All views of the same person must have the same personID
+            # Logic: Exactly same as test_process_label.py - for each person, collect all global_ids from all views,
+            # then assign the most common one (should be only one if multiview matching is correct)
+            for frame_idx in range(frame_count):
+                if frame_idx >= len(all_annotations):
+                    continue
+                
+                frame_data = all_annotations[frame_idx]
+                person_to_global_id = {}  # {person_idx: final_global_id}
+                
+                # Process each person exactly like test_process_label.py does
+                for person_idx, person in enumerate(frame_data):
+                    if not isinstance(person, dict):
+                        continue
+                    
+                    # Collect all global_ids from all views of this person
+                    # In test_process_label.py, each view gets its global_id individually
+                    # But for personID, we need to ensure all views have the same ID
+                    global_ids_for_person = []
+                    
+                    for view_idx, view in enumerate(person.get("views", [])):
+                        if not isinstance(view, dict):
+                            continue
+                        if view.get("xmin") == -1:
+                            continue
+                        
+                        view_num = view.get("viewNum")
+                        cam_name = VIEW_TO_CAMERA.get(view_num)
+                        
+                        if cam_name:
+                            # Get local_id from annotation_to_local_id_map (exactly like test_process_label.py line 718)
+                            local_id = annotation_to_local_id_map.get((frame_idx, cam_name, person_idx, view_idx), -1)
+                            
+                            if local_id >= 0:
+                                # Get global_id from mapping (exactly like test_process_label.py line 724)
+                                final_global_id = global_id_map.get((frame_idx, cam_name, local_id), -1)
+                                
+                                if final_global_id >= 0:
+                                    global_ids_for_person.append(final_global_id)
+                    
+                    # Assign the most common global_id to this person
+                    # If multiview matching worked correctly, all views should have the same global_id
+                    if global_ids_for_person:
+                        # Count occurrences of each global_id
+                        from collections import Counter
+                        global_id_counts = Counter(global_ids_for_person)
+                        # Get the most common global_id
+                        most_common_global_id, count = global_id_counts.most_common(1)[0]
+                        person_to_global_id[person_idx] = most_common_global_id
+                        
+                        # Warn if person has multiple different global_ids (indicates matching issue)
+                        if len(global_id_counts) > 1:
+                            logger.warning(f"Person {person_idx} in frame {frame_idx} has multiple global_ids: {dict(global_id_counts)}. Using most common: {most_common_global_id} (appears {count} times)")
+                
+                # Update personID for all persons in this frame
+                # All views of the same person will have the same personID
+                for person_idx, final_global_id in person_to_global_id.items():
+                    if person_idx < len(frame_data):
+                        # Convert numpy types to Python native types for JSON serialization
+                        frame_data[person_idx]["personID"] = int(final_global_id)
+            
+            # Get centroids from preprocessing and update ground_points
+            # Centroids are in BEV coordinates (memory coordinates), need to convert to world grid coordinates
+            centroids_by_final_id = preprocessor.get_centroids_by_final_id()
+            
+            # Update ground_points for each person based on cluster centroids
+            # Track which (frame_idx, person_id) pairs have been updated to avoid duplicates
+            updated_pairs = set()
+            
+            for frame_idx in range(frame_count):
+                if frame_idx >= len(all_annotations):
+                    continue
+                
+                frame_data = all_annotations[frame_idx]
+                
+                for person_idx, person in enumerate(frame_data):
+                    person_id = person.get("personID")
+                    if person_id is not None:
+                        # Only update once per (frame_idx, person_id) pair to avoid duplicates
+                        pair_key = (frame_idx, person_id)
+                        if pair_key in updated_pairs:
+                            continue
+                        
+                        # Get centroid for this person in this frame
+                        centroid_bev = centroids_by_final_id.get((frame_idx, person_id))
+                        if centroid_bev is not None:
+                            # Convert BEV coordinates (memory coordinates) to world grid coordinates
+                            # For now, BEV coordinates are already in world grid space (identity transform)
+                            # If transformation is needed, use self._mem_to_worldgrid() method
+                            mem_x, mem_y = centroid_bev[0], centroid_bev[1]
+                            
+                            # Convert to world grid coordinates
+                            # Note: Currently _mem_to_worldgrid returns identity, but should use proper transform if available
+                            grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
+                            
+                            # Update ground_points only for the first person with this personID in this frame
+                            frame_data[person_idx]["ground_points"] = [float(grid_x), float(grid_y)]
+                            updated_pairs.add(pair_key)
+            
+            # Save updated annotations
+            for frame_idx, annot_data in enumerate(all_annotations):
+                if frame_idx < len(annotation_files):
+                    annot_file = annotation_files[frame_idx]
+                    # Convert numpy types to Python native types for JSON serialization
+                    def convert_to_native(obj):
+                        """Recursively convert numpy types to Python native types"""
+                        if isinstance(obj, np.integer):
+                            return int(obj)
+                        elif isinstance(obj, np.floating):
+                            return float(obj)
+                        elif isinstance(obj, np.ndarray):
+                            return obj.tolist()
+                        elif isinstance(obj, dict):
+                            return {key: convert_to_native(value) for key, value in obj.items()}
+                        elif isinstance(obj, list):
+                            return [convert_to_native(item) for item in obj]
+                        return obj
+                    
+                    annot_data_serializable = convert_to_native(annot_data)
+                    with open(annot_file, 'w') as f:
+                        json.dump(annot_data_serializable, f, indent=4)
+            
+            progress.setValue(100)
+            QtWidgets.QApplication.processEvents()
+            
+            # Cleanup temp folder
+            shutil.rmtree(temp_calib_folder, ignore_errors=True)
+            
+            QMessageBox.information(
+                self,
+                "Preprocessing",
+                f"Preprocessing completed successfully!\nProcessed {frame_count} frames.\nUpdated {len(global_id_map)} mappings."
+            )
+            
+            # Reload current frame to show updated IDs
+            if self.filename:
+                self._load_global_annotations(self._get_current_frame_index())
+        
+        except Exception as e:
+            logger.error(f"Preprocessing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self,
+                "Preprocessing Error",
+                f"Preprocessing failed:\n{str(e)}"
+            )
+        finally:
+            progress.close()
+    
+    def _get_current_frame_index(self) -> int:
+        """Get current frame index from filename"""
+        if not self.filename:
+            return 0
+        try:
+            if self.filename.startswith("Frame_"):
+                return int(self.filename.split("_")[1])
+            return 0
+        except:
+            return 0
 
     def duplicateSelectedShape(self):
         self.copySelectedShape()

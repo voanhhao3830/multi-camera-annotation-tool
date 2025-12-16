@@ -72,7 +72,9 @@ class MultiCameraTracking:
     
     def _cluster_multiview_detections(
             self,
-            bev_coords: List[Tuple[float, float, str, int]]
+            bev_coords: List[Tuple[float, float, str, int]],
+            prev_centroids: Optional[np.ndarray] = None,
+            max_centroid_movement: float = 5.0
         ) -> Dict[int, List[Tuple[str, int]]]:
         """
         Cluster BEV coordinates with a hard constraint:
@@ -81,22 +83,27 @@ class MultiCameraTracking:
           đảm bảo mỗi (cluster, camera) xuất hiện tối đa 1 lần.
         - Nếu một detection không thể được gán vào bất kỳ cluster KMeans nào mà vẫn giữ được ràng buộc,
           nó sẽ được đưa vào một cluster mới (singleton cluster), vẫn đảm bảo ràng buộc theo camera.
+        
+        Args:
+            bev_coords: List of (x, y, camera_name, local_id)
+            prev_centroids: Previous frame's cluster centers for warm start (shape: [n_clusters, 2])
+            max_centroid_movement: Maximum allowed movement of cluster centers in meters (for stability)
         """
         if not bev_coords:
             return {}
 
-        # Chuẩn bị dữ liệu
+        # Prepare data
         all_coords = [(x, y) for x, y, _, _ in bev_coords]
         coord_to_camera = [(cam, det_idx) for _, _, cam, det_idx in bev_coords]
         coords_array = np.array(all_coords, dtype=np.float32)
 
         n_points = len(coords_array)
         all_cams = {cam for cam, _ in coord_to_camera}
-        size_limit = max(1, len(all_cams))  # tối đa mỗi cluster chứa nhiều nhất #cams detections
+        size_limit = max(1, len(all_cams))  # maximum detections per cluster is #cams
 
-        # Xác định số cụm KMeans ban đầu
+        # Determine initial KMeans cluster count
         if self.n_clusters is None:
-            # Ước lượng thô: mỗi object xuất hiện ở khoảng 3 camera
+            # Rough estimate: each object appears in approximately 3 cameras
             estimated_clusters = max(1, n_points // 3)
             n_clusters = min(estimated_clusters, n_points)
         else:
@@ -105,15 +112,31 @@ class MultiCameraTracking:
         if n_clusters <= 0:
             return {}
 
-        # KMeans để lấy centroid
-        kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
-        kmeans.fit(coords_array)
-        centroids = kmeans.cluster_centers_
+        # KMeans to get centroids with warm start from previous frame
+        if prev_centroids is not None and len(prev_centroids) == n_clusters:
+            # Use previous centroids as initialization
+            kmeans = KMeans(n_clusters=n_clusters, n_init=1, init=prev_centroids, random_state=42)
+            kmeans.fit(coords_array)
+            centroids = kmeans.cluster_centers_
+            
+            # Apply constraint: limit centroid movement distance
+            for i in range(len(centroids)):
+                if i < len(prev_centroids):
+                    dist = np.linalg.norm(centroids[i] - prev_centroids[i])
+                    if dist > max_centroid_movement:
+                        # If moved too far, keep old position and adjust slightly
+                        direction = (centroids[i] - prev_centroids[i]) / dist
+                        centroids[i] = prev_centroids[i] + direction * max_centroid_movement
+        else:
+            # No previous centroids or count mismatch, use random init
+            kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=42)
+            kmeans.fit(coords_array)
+            centroids = kmeans.cluster_centers_
 
-        # Tính khoảng cách đến các centroid
+        # Calculate distances to centroids
         dists = np.linalg.norm(coords_array[:, None, :] - centroids[None, :, :], axis=2)
 
-        # Thứ tự detection: gần centroid nhất trước
+        # Detection order: closest to centroid first
         nearest_centroid_dist = np.min(dists, axis=1)
         detection_order = list(np.argsort(nearest_centroid_dist))
 
@@ -121,7 +144,7 @@ class MultiCameraTracking:
         cluster_cameras: Dict[int, set] = {i: set() for i in range(n_clusters)}
         unassigned: List[int] = []
 
-        # Gán: cụm gần nhất, KHÔNG trùng camera, chưa vượt size_limit
+        # Assign: nearest cluster, NO same camera, not exceeding size_limit
         for idx in detection_order:
             cam_name, _ = coord_to_camera[idx]
             centroid_candidates = list(np.argsort(dists[idx]))
@@ -130,7 +153,7 @@ class MultiCameraTracking:
                 if len(clusters[c]) >= size_limit:
                     continue
                 if cam_name in cluster_cameras[c]:
-                    continue  # ràng buộc: 1 cluster không chứa 2 object từ cùng 1 cam
+                    continue  # constraint: 1 cluster cannot contain 2 objects from same camera
                 clusters[c].append(idx)
                 cluster_cameras[c].add(cam_name)
                 assigned = True
@@ -139,7 +162,7 @@ class MultiCameraTracking:
             if not assigned:
                 unassigned.append(idx)
 
-        # Với các detection chưa gán, tạo cluster mới (singleton) để vẫn giữ ràng buộc camera
+        # For unassigned detections, create new cluster (singleton) to maintain camera constraint
         next_cluster_id = n_clusters
         for idx in unassigned:
             cam_name, _ = coord_to_camera[idx]
@@ -147,7 +170,7 @@ class MultiCameraTracking:
             cluster_cameras[next_cluster_id] = {cam_name}
             next_cluster_id += 1
 
-        # Build kết quả cuối: {cluster_id: [(camera_name, local_id), ...]}
+        # Build final result: {cluster_id: [(camera_name, local_id), ...]}
         result: Dict[int, List[Tuple[str, int]]] = {}
         for cid, point_indices in clusters.items():
             if not point_indices:
@@ -161,12 +184,16 @@ class MultiCameraTracking:
         return result
 
     
-    def match_multiview(self, detections: Dict[str, List[List[float]]]) -> Dict[Tuple[str, int], int]:
+    def match_multiview(self, detections: Dict[str, List[List[float]]], 
+                       prev_centroids: Optional[np.ndarray] = None,
+                       max_centroid_movement: float = 5.0) -> Dict[Tuple[str, int], int]:
         """
         Match objects across multiple cameras in a single frame using K-means clustering
         
         Args:
             detections: Dict mapping camera_name -> list of bboxes [x_min, y_min, x_max, y_max]
+            prev_centroids: Previous frame's cluster centers for warm start (shape: [n_clusters, 2])
+            max_centroid_movement: Maximum allowed movement of cluster centers in meters (for stability)
             
         Returns:
             Dict mapping (camera_name, local_id) -> global_id
@@ -204,10 +231,10 @@ class MultiCameraTracking:
         
         # Cluster BEV coordinates
         if bev_coords_list:
-            clusters = self._cluster_multiview_detections(bev_coords_list)
+            clusters = self._cluster_multiview_detections(bev_coords_list, prev_centroids, max_centroid_movement)
             next_global_id = 0
 
-            # Gán global_id liên tục cho từng cụm
+            # Assign consecutive global_id to each cluster
             for cluster_id in sorted(clusters.keys()):
                 members = clusters[cluster_id]
                 if not members:
@@ -227,7 +254,7 @@ class MultiCameraTracking:
             next_global_id += 1
 
         if not self.global_id_map:
-            print("WARNING: No detections found for multiview matching")
+            # Don't print warning here - it will be logged at higher level if needed
             return {}
         
         return self.global_id_map
@@ -243,6 +270,43 @@ class MultiCameraTracking:
     def get_bev_coords(self, camera_name: str, local_id: int) -> Optional[Tuple[float, float]]:
         """Get BEV coordinates for an object"""
         return self.bev_coords.get((camera_name, local_id))
+    
+    def get_cluster_centroids(self) -> Optional[np.ndarray]:
+        """
+        Get current frame's cluster centroids after clustering.
+        Returns centroids as numpy array of shape [n_clusters, 2] or None if not available.
+        """
+        if not self.global_id_map:
+            return None
+        
+        # Group BEV coordinates by global_id
+        global_id_points = {}  # {global_id: [(x, y), ...]}
+        for (camera_name, local_id), global_id in self.global_id_map.items():
+            bev_coord = self.get_bev_coords(camera_name, local_id)
+            if bev_coord is not None:
+                x, y = bev_coord
+                if np.isfinite(x) and np.isfinite(y):
+                    if global_id not in global_id_points:
+                        global_id_points[global_id] = []
+                    global_id_points[global_id].append((x, y))
+        
+        if not global_id_points:
+            return None
+        
+        # Compute centroids for each global_id
+        centroids = []
+        sorted_ids = sorted(global_id_points.keys())
+        for global_id in sorted_ids:
+            points = global_id_points[global_id]
+            if points:
+                points_array = np.array(points)
+                centroid = np.mean(points_array, axis=0)
+                centroids.append(centroid)
+        
+        if not centroids:
+            return None
+        
+        return np.array(centroids, dtype=np.float32)
     
     def map_to_local_ids(self, camera_name: str, global_ids: List[int]) -> Dict[int, int]:
         """

@@ -116,7 +116,8 @@ class PreprocessLabel:
     """
     
     def __init__(self, calib_folder: str, max_distance_multiview: float = 2.0, 
-                 max_distance_tracking: float = 50.0, n_clusters: int = None):
+                 max_distance_tracking: float = 50.0, n_clusters: int = None,
+                 max_centroid_movement: float = 5.0, smoothing_factor: float = 0.3):
         """
         Args:
             calib_folder: Path to calibration folder containing intrinsic/extrinsic
@@ -126,11 +127,16 @@ class PreprocessLabel:
                        For offline tracking, this should be set to the exact number of objects.
                        KMeans will create exactly n_clusters clusters (some may be empty if fewer detections).
                        If None, will be auto-determined from number of detections (not recommended for offline tracking)
+            max_centroid_movement: Maximum allowed movement of cluster centers between frames (meters) for stability
+            smoothing_factor: Smoothing factor for cluster centers (0.0 = no smoothing, 1.0 = full smoothing)
+                             Lower values mean more responsive to changes, higher values mean more stable
         """
         self.calib_folder = calib_folder
         self.max_distance_multiview = max_distance_multiview
         self.max_distance_tracking = max_distance_tracking
         self.n_clusters = n_clusters
+        self.max_centroid_movement = max_centroid_movement
+        self.smoothing_factor = smoothing_factor
         
         # Initialize multiview matcher
         self.multiview_matcher = MultiCameraTracking(
@@ -141,6 +147,9 @@ class PreprocessLabel:
         
         # Final mapping: (frame_idx, camera_name, local_id) -> final_global_id
         self.final_global_id_map = {}
+        
+        # Store frame BEV coordinates (centroids) for later access
+        self.frame_bev_coords = {}  # {frame_idx: {frame_global_id: (x, y)}}
         
     def preprocess(self, multi_camera_detections: Dict[str, List[List[List[float]]]]) -> Dict[Tuple[int, str, int], int]:
         """
@@ -167,6 +176,8 @@ class PreprocessLabel:
         frame_bev_coords = {}
         
         print(f"Step 1: Multiview matching for {num_frames} frames...")
+        prev_smoothed_centroids = None  # Track smoothed centroids for next frame
+        
         for frame_idx in range(num_frames):
             # Get detections for this frame
             frame_detections = {}
@@ -176,8 +187,12 @@ class PreprocessLabel:
                 else:
                     frame_detections[camera_name] = []
             
-            # Match multiview for this frame
-            multiview_map = self.multiview_matcher.match_multiview(frame_detections)
+            # Match multiview for this frame with warm start from previous frame
+            multiview_map = self.multiview_matcher.match_multiview(
+                frame_detections,
+                prev_centroids=prev_smoothed_centroids,
+                max_centroid_movement=self.max_centroid_movement
+            )
             frame_multiview_maps[frame_idx] = multiview_map
             
             # Collect BEV coordinates for each frame_global_id (centroid of cluster)
@@ -196,13 +211,20 @@ class PreprocessLabel:
                         frame_global_id_points[frame_global_id].append((x, y))
             
             # Compute centroids for each frame_global_id
+            current_frame_centroids = {}  # {frame_global_id: np.array([x, y])}
             for frame_global_id, points in frame_global_id_points.items():
                 if points:
                     points_array = np.array(points)
                     centroid = np.mean(points_array, axis=0)
+                    current_frame_centroids[frame_global_id] = centroid
                     # Round centroid to ensure consistency (~1 cm precision)
                     centroid_rounded = (round(float(centroid[0]), 2), round(float(centroid[1]), 2))
                     frame_global_id_coords[frame_global_id] = centroid_rounded
+            
+            # Apply smoothing with previous centroids for better stability
+            # Note: smoothing is only applied after merge and remap IDs to ensure consistency
+            # Temporarily store current centroids to use after merge
+            temp_current_centroids = current_frame_centroids.copy()
             
             # For offline tracking: ensure we have exactly n_clusters clusters.
             # With KMeans, n_clusters is fixed and KMeans always creates exactly n_clusters clusters.
@@ -319,7 +341,90 @@ class PreprocessLabel:
                     if num_actual_clusters < self.n_clusters and frame_idx == 0:
                         print(f"  Frame {frame_idx}: Found {num_actual_clusters} clusters (expected {self.n_clusters})")
             
+            # Apply smoothing with previous centroids after merge and remap
+            if prev_smoothed_centroids is not None and self.n_clusters is not None and len(frame_global_id_coords) > 0:
+                # Create array of current centroids sorted by ID
+                sorted_ids = sorted(frame_global_id_coords.keys())
+                current_centroids_array = np.array([frame_global_id_coords[fid] for fid in sorted_ids])
+                
+                # Ensure prev_smoothed_centroids has the same count as current
+                if len(prev_smoothed_centroids) == len(current_centroids_array):
+                    # Match current with previous using Hungarian algorithm
+                    distances = np.linalg.norm(
+                        current_centroids_array[:, None, :] - prev_smoothed_centroids[None, :, :],
+                        axis=2
+                    )
+                    row_ind, col_ind = linear_sum_assignment(distances)
+                    
+                    # Apply smoothing: smoothed = (1-alpha) * current + alpha * previous
+                    smoothed_centroids_array = np.zeros_like(current_centroids_array)
+                    # row_ind and col_ind have the same length, each element i: row_ind[i] -> col_ind[i]
+                    for match_idx in range(len(row_ind)):
+                        current_idx = row_ind[match_idx]
+                        prev_idx = col_ind[match_idx]
+                        if current_idx < len(current_centroids_array) and prev_idx < len(prev_smoothed_centroids):
+                            current_cent = current_centroids_array[current_idx]
+                            prev_cent = prev_smoothed_centroids[prev_idx]
+                            smoothed_cent = (1 - self.smoothing_factor) * current_cent + self.smoothing_factor * prev_cent
+                            smoothed_centroids_array[current_idx] = smoothed_cent
+                            
+                            # Update frame_global_id_coords with smoothed centroid
+                            fid = sorted_ids[current_idx]
+                            centroid_rounded = (round(float(smoothed_cent[0]), 2), round(float(smoothed_cent[1]), 2))
+                            frame_global_id_coords[fid] = centroid_rounded
+                    
+                    # Prepare smoothed centroids for next frame
+                    # Sort by ID to ensure consistent order
+                    prev_smoothed_centroids = smoothed_centroids_array.copy()
+                elif len(prev_smoothed_centroids) == self.n_clusters and len(current_centroids_array) <= self.n_clusters:
+                    # If previous has n_clusters but current has fewer, only smooth matched ones
+                    # Pad current with zeros to match n_clusters
+                    padded_current = np.zeros((self.n_clusters, 2))
+                    padded_current[:len(current_centroids_array)] = current_centroids_array
+                    # Assign large value to positions without current centroid to avoid matching
+                    padded_current[len(current_centroids_array):] = np.inf
+                    
+                    distances = np.linalg.norm(
+                        padded_current[:, None, :] - prev_smoothed_centroids[None, :, :],
+                        axis=2
+                    )
+                    # Replace inf with large value for Hungarian algorithm to work
+                    distances = np.where(np.isfinite(distances), distances, 1e10)
+                    row_ind, col_ind = linear_sum_assignment(distances)
+                    
+                    smoothed_centroids_array = prev_smoothed_centroids.copy()
+                    for match_idx in range(len(row_ind)):
+                        current_idx = row_ind[match_idx]
+                        prev_idx = col_ind[match_idx]
+                        if current_idx < len(current_centroids_array) and prev_idx < len(prev_smoothed_centroids):
+                            current_cent = current_centroids_array[current_idx]
+                            prev_cent = prev_smoothed_centroids[prev_idx]
+                            smoothed_cent = (1 - self.smoothing_factor) * current_cent + self.smoothing_factor * prev_cent
+                            smoothed_centroids_array[prev_idx] = smoothed_cent
+                            
+                            # Update frame_global_id_coords
+                            fid = sorted_ids[current_idx]
+                            centroid_rounded = (round(float(smoothed_cent[0]), 2), round(float(smoothed_cent[1]), 2))
+                            frame_global_id_coords[fid] = centroid_rounded
+                    
+                    prev_smoothed_centroids = smoothed_centroids_array
+                else:
+                    # Cannot match, use current centroids
+                    if len(current_centroids_array) > 0:
+                        prev_smoothed_centroids = current_centroids_array.copy()
+                    else:
+                        prev_smoothed_centroids = None
+            else:
+                # No smoothing, prepare current centroids for next frame
+                if len(frame_global_id_coords) > 0:
+                    sorted_ids = sorted(frame_global_id_coords.keys())
+                    prev_smoothed_centroids = np.array([frame_global_id_coords[fid] for fid in sorted_ids])
+                else:
+                    prev_smoothed_centroids = None
+            
             frame_bev_coords[frame_idx] = frame_global_id_coords
+            # Store in instance variable for later access
+            self.frame_bev_coords[frame_idx] = frame_global_id_coords
             
             if (frame_idx + 1) % 10 == 0:
                 print(f"  Processed {frame_idx + 1}/{num_frames} frames...")
@@ -334,6 +439,9 @@ class PreprocessLabel:
         # For offline tracking with fixed number of objects, ensure consistent ordering
         list_of_labels = []  # List of frames, each frame is list of (x, y) coordinates
         frame_global_id_to_idx = []  # For each frame: {frame_global_id: idx_in_list}
+        
+        # Store for later access
+        self.frame_global_id_to_idx = frame_global_id_to_idx
         
         # Get expected number of objects from n_clusters
         expected_objects = self.n_clusters
@@ -371,6 +479,9 @@ class PreprocessLabel:
             )
             temporal_global_id_map = object_tracker.assign_global_id()
         # temporal_global_id_map: {(frame_idx, obj_idx): final_global_id}
+        
+        # Store for later access
+        self.temporal_global_id_map = temporal_global_id_map
         
         # Verify ID consistency: check if we have the expected number of unique IDs
         unique_ids = set(temporal_global_id_map.values())
@@ -424,3 +535,37 @@ class PreprocessLabel:
     def get_all_global_ids(self) -> Dict[Tuple[int, str, int], int]:
         """Get all final global ID mappings"""
         return self.final_global_id_map.copy()
+    
+    def get_frame_bev_coords(self) -> Dict[int, Dict[int, Tuple[float, float]]]:
+        """
+        Get BEV coordinates (centroids) for each frame and frame_global_id.
+        
+        Returns:
+            Dict mapping frame_idx -> {frame_global_id: (x, y)} where (x, y) are BEV coordinates
+        """
+        return self.frame_bev_coords.copy()
+    
+    def get_centroids_by_final_id(self) -> Dict[Tuple[int, int], Tuple[float, float]]:
+        """
+        Get centroids mapped by (frame_idx, final_global_id).
+        
+        Returns:
+            Dict mapping (frame_idx, final_global_id) -> (x, y) BEV coordinates
+        """
+        result = {}
+        
+        if not hasattr(self, 'frame_global_id_to_idx') or not hasattr(self, 'temporal_global_id_map'):
+            return result
+        
+        for frame_idx in range(len(self.frame_bev_coords)):
+            frame_bev = self.frame_bev_coords.get(frame_idx, {})
+            frame_id_to_idx = self.frame_global_id_to_idx[frame_idx] if frame_idx < len(self.frame_global_id_to_idx) else {}
+            
+            for frame_global_id, centroid in frame_bev.items():
+                obj_idx = frame_id_to_idx.get(frame_global_id)
+                if obj_idx is not None:
+                    final_global_id = self.temporal_global_id_map.get((frame_idx, obj_idx))
+                    if final_global_id is not None:
+                        result[(frame_idx, final_global_id)] = centroid
+        
+        return result
