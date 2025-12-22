@@ -73,7 +73,10 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Dragging state for points
         self.dragging_point_idx: Optional[int] = None
-        self.drag_start_pos: Optional[QPointF] = None
+        self.drag_start_pos: Optional[QPointF] = None  # screen coordinates
+        self.drag_start_grid: Optional[tuple[float, float]] = None  # (grid_x, grid_y)
+        # Minimum mouse movement (in screen pixels) to treat as a drag.
+        self._drag_threshold_pixels: float = 4.0
         
         # Drawing state
         self.drawing_box = False
@@ -520,33 +523,33 @@ class BEVCanvas(QtWidgets.QWidget):
         for idx, (x, y, label, group_id) in enumerate(self.points):
             screen_pos = self._grid_to_screen(x, y)
             
-            # Determine color based on group_id for consistency with camera views
             if group_id is not None:
-                # Use same colormap as app.py for consistent colors
                 r, g, b = self._get_rgb_by_group_id(group_id)
-                color = QtGui.QColor(r, g, b)
-                # Debug: log color for first point only to avoid spam
-                # if idx == 0:
-                    # logger.debug(f"BEV paintEvent: point[{idx}] group_id={group_id}, color=RGB({r},{g},{b})")
+                base_color = QtGui.QColor(r, g, b)
             else:
-                color = self.box_color
-            
-            # Check if selected or hovered (override color)
-            if idx == self.selected_point_idx:
-                color = self.selected_box_color
-            elif idx == self.hovered_point_idx:
+                base_color = self.box_color
+
+            color = base_color
+            radius = self.point_radius
+            pen_width = 2
+
+            if idx == self.hovered_point_idx:
                 color = self.hovered_box_color
-            
+                radius = self.point_radius * 1.5
+                pen_width = 3
+            elif idx == self.selected_point_idx:
+                color = self.selected_box_color
+
             # Draw filled circle
-            p.setPen(QtGui.QPen(color, 2))
+            p.setPen(QtGui.QPen(color, pen_width))
             p.setBrush(QtGui.QBrush(color, Qt.SolidPattern))
-            p.drawEllipse(screen_pos, self.point_radius, self.point_radius)
+            p.drawEllipse(screen_pos, radius, radius)
             
             # Draw label text next to point
             if group_id is not None:
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
                 text_rect = QtCore.QRectF(
-                    screen_pos.x() + self.point_radius + 2,
+                    screen_pos.x() + radius + 2,
                     screen_pos.y() - 8,
                     50, 16
                 )
@@ -587,8 +590,10 @@ class BEVCanvas(QtWidgets.QWidget):
             point_idx = self._get_point_at_position(pos)
             if point_idx is not None:
                 self.selected_point_idx = point_idx
-                self.dragging_point_idx = point_idx  # Start dragging
+                self.dragging_point_idx = point_idx  # Start potential dragging
                 self.drag_start_pos = pos
+                x0, y0, _, _ = self.points[point_idx]
+                self.drag_start_grid = (x0, y0)
                 _, _, _, group_id = self.points[point_idx]
                 self.pointSelected.emit(group_id)
                 self.update()
@@ -652,14 +657,18 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Handle point dragging
         if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
-            # Get grid coordinates for new position
-            new_x, new_y = self._screen_to_grid(pos)
-            
-            # Update point position
-            _, _, label, group_id = self.points[self.dragging_point_idx]
-            self.points[self.dragging_point_idx] = (new_x, new_y, label, group_id)
-            self.update()
-            return
+            if self.drag_start_pos is not None:
+                dx = pos.x() - self.drag_start_pos.x()
+                dy = pos.y() - self.drag_start_pos.y()
+                if (dx * dx + dy * dy) >= (self._drag_threshold_pixels ** 2):
+                    # Get grid coordinates for new position
+                    new_x, new_y = self._screen_to_grid(pos)
+                    
+                    # Update point position
+                    _, _, label, group_id = self.points[self.dragging_point_idx]
+                    self.points[self.dragging_point_idx] = (new_x, new_y, label, group_id)
+                    self.update()
+                    return
         
         # First check point hover (higher priority)
         point_idx = self._get_point_at_position(pos)
@@ -696,11 +705,30 @@ class BEVCanvas(QtWidgets.QWidget):
         if event.button() == Qt.LeftButton:
             # Finish point dragging
             if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
-                # Get final position and emit signal
-                new_x, new_y, label, group_id = self.points[self.dragging_point_idx]
-                self.pointMoved.emit(group_id, new_x, new_y)
+                did_drag = False
+                if self.drag_start_pos is not None:
+                    end_pos = event.localPos()
+                    dx = end_pos.x() - self.drag_start_pos.x()
+                    dy = end_pos.y() - self.drag_start_pos.y()
+                    if (dx * dx + dy * dy) >= (self._drag_threshold_pixels ** 2):
+                        did_drag = True
+
+                if did_drag:
+                    # Get final position and emit signal
+                    new_x, new_y, label, group_id = self.points[self.dragging_point_idx]
+                    self.pointMoved.emit(group_id, new_x, new_y)
+                else:
+                    if (
+                        self.drag_start_grid is not None
+                        and 0 <= self.dragging_point_idx < len(self.points)
+                    ):
+                        _, _, label, group_id = self.points[self.dragging_point_idx]
+                        x0, y0 = self.drag_start_grid
+                        self.points[self.dragging_point_idx] = (x0, y0, label, group_id)
+
                 self.dragging_point_idx = None
                 self.drag_start_pos = None
+                self.drag_start_grid = None
                 self.update()
                 return
             

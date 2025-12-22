@@ -2044,6 +2044,75 @@ class MainWindow(QtWidgets.QMainWindow):
                     shape._bev_highlighted = highlight
         
         self.multi_camera_canvas.update()
+
+    def _sync_bev_points_with_shapes(self):
+        """
+        Ensure BEV points and 2D boxes are consistent:
+        - Remove BEV points whose group_id không còn tồn tại ở bất kỳ box nào.
+        - Tự động tạo BEV point (ở vị trí mặc định) cho mọi group_id đang có box nhưng chưa có point.
+        """
+        if not self.bev_canvas or not self.multi_camera_canvas:
+            return
+
+        # 1) Thu thập tất cả group_id đang có box trên multi-camera canvas
+        shape_group_ids = set()
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                gid = getattr(shape, "group_id", None)
+                if gid is not None:
+                    shape_group_ids.add(gid)
+
+        # 2) Lọc bỏ các BEV point "mồ côi" (không còn box nào mang group_id đó)
+        filtered_points = []
+        for mem_x, mem_y, label, gid in self.bev_canvas.points:
+            if gid is None or gid in shape_group_ids:
+                filtered_points.append((mem_x, mem_y, label, gid))
+        self.bev_canvas.points = filtered_points
+
+        # 3) Thêm BEV point mặc định cho mọi group_id đang có box nhưng chưa có point.
+        #    Để tránh "dồn cục" ở giữa, mỗi group_id sẽ được đặt tại một vị trí
+        #    hơi lệch nhau quanh tâm (dựa trên group_id).
+        existing_point_ids = {
+            gid for _, _, _, gid in self.bev_canvas.points if gid is not None
+        }
+
+        for gid in shape_group_ids:
+            if gid not in existing_point_ids:
+                default_x, default_y = self._get_default_bev_point_position(gid)
+                self.bev_canvas.addPoint(default_x, default_y, "object", gid)
+
+        # Cập nhật lại danh sách ground point
+        self._update_ground_point_list()
+
+    def _get_default_bev_point_position(self, group_id: int) -> tuple[float, float]:
+        """
+        Tạo vị trí mặc định cho BEV point dựa trên group_id, tránh chồng nhiều điểm
+        đúng tâm. Dùng "golden angle" để rải đều các điểm trên vòng tròn quanh tâm.
+        """
+        # Tâm BEV
+        cx = self._bev_x / 2.0 if hasattr(self, "_bev_x") else 600.0
+        cy = self._bev_y / 2.0 if hasattr(self, "_bev_y") else 400.0
+
+        # Bán kính tối đa ~15% kích thước nhỏ hơn của BEV
+        r_max = 0.15 * min(
+            getattr(self, "_bev_x", 1200.0),
+            getattr(self, "_bev_y", 800.0),
+        )
+        # Golden angle để rải đều điểm
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+        k = max(1, int(group_id))  # tránh 0
+        angle = k * golden_angle
+        radius = r_max * (0.5 + 0.5 * ((k % 5) / 4.0))  # một vài vòng đồng tâm
+
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+
+        # Clamp trong khung BEV
+        bev_x = getattr(self, "_bev_x", 1200.0)
+        bev_y = getattr(self, "_bev_y", 800.0)
+        x = max(0.0, min(float(x), bev_x))
+        y = max(0.0, min(float(y), bev_y))
+        return x, y
     
     def _delete_ground_point(self, group_id: int):
         """Delete ground point and all related bounding boxes"""
@@ -2282,9 +2351,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if person_id is None:
                     continue
                 
-                # Track if point was added to BEV (point is required for centroid)
-                point_added_to_bev = False
-                
                 # Add 3D box on BEV if box_3d metadata is available
                 if self.bev_canvas and box_3d:
                     try:
@@ -2311,79 +2377,22 @@ class MainWindow(QtWidgets.QMainWindow):
                             self.bev_canvas.boxes_3d.append((center, size, rotation, "object", person_id))
                             logger.info(f"Restored 3D box for person {person_id}: center=({mem_x:.1f}, {mem_y:.1f}, {z:.1f}), size=({w:.1f}, {h:.1f}, {d:.1f})")
                             
-                            # IMPORTANT: Also add point (centroid) for this person
-                            # Point represents the centroid of the cluster, which is required
-                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                            point_added_to_bev = True
-                            
                     except Exception as box_e:
                         logger.warning(f"Failed to load 3D box for person {person_id}: {box_e}")
                         import traceback
                         traceback.print_exc()
                 
-                # Add point (centroid) if not already added
-                # Point is required for each person as it represents the centroid of the cluster
-                if self.bev_canvas and not point_added_to_bev:
-                    if ground_points and len(ground_points) >= 2:
-                        # ground_points are world grid coordinates (grid_x, grid_y)
-                        grid_x = ground_points[0]
-                        grid_y = ground_points[1]
-                        # Check if ground_points are valid (positive values)
-                        if grid_x >= 0 and grid_y >= 0:
-                            # Transform to memory coordinates for BEV display
-                            mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
-                            # Add point to BEV canvas (not a box)
-                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                            point_added_to_bev = True
-                    
-                    # If still no point added, try to compute from views or use default position
-                    if not point_added_to_bev:
-                        # Try to compute BEV position from first valid view
-                        for view in views:
-                            view_num = view.get("viewNum", -1)
-                            xmin = view.get("xmin", -1)
-                            ymin = view.get("ymin", -1)
-                            xmax = view.get("xmax", -1)
-                            ymax = view.get("ymax", -1)
-                            
-                            if xmin >= 0 and ymin >= 0 and xmax >= 0 and ymax >= 0:
-                                # Try to project bbox to BEV
-                                try:
-                                    from labelme.utils.project_bev import convert_bbox_to_bev
-                                    # VIEW_TO_CAMERA mapping: viewNum (1-indexed) -> camera name
-                                    VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
-                                    camera_name = VIEW_TO_CAMERA.get(view_num)
-                                    if camera_name:
-                                        bbox = [xmin, ymin, xmax, ymax]
-                                        # Find calibration folder
-                                        root_dir = None
-                                        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
-                                            root_dir = self._aicv_root_dir
-                                        elif self._prev_opened_dir:
-                                            root_dir = self._prev_opened_dir
-                                        
-                                        if root_dir:
-                                            calib_folder = osp.join(root_dir, "calibrations")
-                                            if osp.exists(calib_folder):
-                                                bev_coords = convert_bbox_to_bev(
-                                                    camera_name, bbox, calib_folder, z_world=0.0
-                                                )
-                                                if bev_coords:
-                                                    mem_x, mem_y = bev_coords
-                                                    self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                                                    point_added_to_bev = True
-                                                    logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
-                                                    break
-                                except Exception as e:
-                                    logger.debug(f"Failed to compute BEV from view {view_num}: {e}")
-                        
-                        # If still no point, add a default point at center (will be updated later)
-                        if not point_added_to_bev:
-                            # Use center of BEV canvas as default
-                            default_x = self._bev_x / 2.0 if hasattr(self, '_bev_x') else 600.0
-                            default_y = self._bev_y / 2.0 if hasattr(self, '_bev_y') else 400.0
-                            self.bev_canvas.addPoint(default_x, default_y, "object", person_id)
-                            logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
+                # Add point (centroid) strictly from ground_points (output of preprocessing)
+                if self.bev_canvas and ground_points and len(ground_points) >= 2:
+                    # ground_points are world grid coordinates (grid_x, grid_y)
+                    grid_x = ground_points[0]
+                    grid_y = ground_points[1]
+                    # Check if ground_points are valid (positive values)
+                    if grid_x >= 0 and grid_y >= 0:
+                        # Transform to memory coordinates for BEV display
+                        mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                        # Add point to BEV canvas (each personID -> đúng 1 centroid)
+                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
                         
                 # Add bounding boxes to camera views
                 for view in views:
@@ -3416,6 +3425,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         cell.shapes.append(shape)
                         self.multi_camera_canvas.camera_cells[cell_idx] = cell
                         self.addLabel(shape)
+                        # Tự động tạo BEV point cho box mới nếu có group_id
+                        if self.bev_canvas and shape.group_id is not None:
+                            if not self.bev_canvas.getPointByGroupId(shape.group_id):
+                                default_x, default_y = self._get_default_bev_point_position(shape.group_id)
+                                self.bev_canvas.addPoint(default_x, default_y, shape.label, shape.group_id)
+                                self._update_ground_point_list()
                         self.multi_camera_canvas.current = None
                         self.multi_camera_canvas.current_cell_index = None
                         self.multi_camera_canvas.update()

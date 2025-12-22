@@ -559,13 +559,30 @@ class PreprocessLabel:
         
         for frame_idx in range(len(self.frame_bev_coords)):
             frame_bev = self.frame_bev_coords.get(frame_idx, {})
-            frame_id_to_idx = self.frame_global_id_to_idx[frame_idx] if frame_idx < len(self.frame_global_id_to_idx) else {}
-            
+            frame_id_to_idx = (
+                self.frame_global_id_to_idx[frame_idx]
+                if frame_idx < len(self.frame_global_id_to_idx)
+                else {}
+            )
+
             for frame_global_id, centroid in frame_bev.items():
+                # Map frame_global_id -> index used by the temporal tracker
                 obj_idx = frame_id_to_idx.get(frame_global_id)
-                if obj_idx is not None:
-                    final_global_id = self.temporal_global_id_map.get((frame_idx, obj_idx))
-                    if final_global_id is not None:
-                        result[(frame_idx, final_global_id)] = centroid
+                if obj_idx is None:
+                    # No index (and thus no temporal ID) – fall back to frame_global_id
+                    # so that every cluster/centroid is still represented.
+                    result[(frame_idx, frame_global_id)] = centroid
+                    continue
+
+                # Prefer the temporally smoothed/fixed global ID if available
+                final_global_id = self.temporal_global_id_map.get((frame_idx, obj_idx))
+
+                if final_global_id is None:
+                    # Fallback: if temporal tracking did not return an ID for this centroid,
+                    # use the per-frame cluster ID so that the number of BEV centroids
+                    # remains consistent with the number of clusters.
+                    final_global_id = frame_global_id
+
+                result[(frame_idx, int(final_global_id))] = centroid
         
         return result
