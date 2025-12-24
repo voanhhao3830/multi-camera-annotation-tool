@@ -24,7 +24,7 @@ def shape_to_mask(
     points: list[list[float]],
     shape_type: Optional[str] = None,
     line_width: int = 10,
-    point_size: int = 5,
+    point_size: int = 2,
 ) -> npt.NDArray[np.bool_]:
     mask = PIL.Image.fromarray(np.zeros(img_shape[:2], dtype=np.uint8))
     draw = PIL.ImageDraw.Draw(mask)

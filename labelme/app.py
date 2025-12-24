@@ -152,24 +152,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._aicv_root_dir = None  # Root directory for AICV folder structure
         
         # Import default values from constants
-        try:
-            from labelme.utils.constants import (
-                DEFAULT_INTRINSIC_SCALE, DEFAULT_TRANSLATION_SCALE,
-                DEFAULT_BEV_X, DEFAULT_BEV_Y, DEFAULT_BEV_BOUNDS
-            )
-            self._intrinsic_scale_factor = DEFAULT_INTRINSIC_SCALE
-            self._translation_scale_factor = DEFAULT_TRANSLATION_SCALE
-            self._bev_x = DEFAULT_BEV_X
-            self._bev_y = DEFAULT_BEV_Y
-            self._bev_bounds = DEFAULT_BEV_BOUNDS.copy()
-        except ImportError:
-            # Fallback to hardcoded defaults
-            self._intrinsic_scale_factor = 0.25
-            self._translation_scale_factor = 100.0
-            self._bev_x = 1200
-            self._bev_y = 800
-            self._bev_bounds = [0, 600, 0, 400, 0, 200]
-
+        from labelme.utils.constants import (
+            DEFAULT_INTRINSIC_SCALE, DEFAULT_TRANSLATION_SCALE,
+            DEFAULT_BEV_X, DEFAULT_BEV_Y, DEFAULT_BEV_BOUNDS
+        )
+        self._intrinsic_scale_factor = DEFAULT_INTRINSIC_SCALE
+        self._translation_scale_factor = DEFAULT_TRANSLATION_SCALE
+        self._bev_x = DEFAULT_BEV_X
+        self._bev_y = DEFAULT_BEV_Y
+        self._bev_bounds = DEFAULT_BEV_BOUNDS.copy()
+        
         # Ground Point List (replaces flags widget)
         self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
         self.ground_point_dock.setObjectName("GroundPoints")

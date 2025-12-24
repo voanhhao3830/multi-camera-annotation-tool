@@ -27,15 +27,15 @@ DEFAULT_BOX_SIZE = 50.0  # Legacy: kept for backward compatibility
 # ============================================================================
 
 # Rotation angle for world grid alignment
-WORLD_GRID_THETA = -3  # degrees
+WORLD_GRID_THETA = -1  # degrees
 WORLD_GRID_THETA_RAD = WORLD_GRID_THETA / 180.0 * np.pi
 
 # Scale factor for grid to world conversion
 WORLD_GRID_SCALE = 0.5
 
 # Translation offset for grid to world conversion
-WORLD_GRID_TX = -74
-WORLD_GRID_TY = -54
+WORLD_GRID_TX = -78
+WORLD_GRID_TY = -116
 
 # World grid to world coordinate transformation matrix (3x3 homogeneous)
 # Converts world grid coordinates to world coordinates (meters)
@@ -54,12 +54,12 @@ WORLDCOORD2WORLDGRID_MAT = np.linalg.inv(WORLDGRID2WORLDCOORD_MAT).astype(np.flo
 # ============================================================================
 
 # Default BEV grid dimensions
-DEFAULT_BEV_X = 600   # Grid X dimension (pixels)
-DEFAULT_BEV_Y = 400   # Grid Y dimension (pixels)
+DEFAULT_BEV_X = 512 * 2   # Grid X dimension (pixels)
+DEFAULT_BEV_Y = 408 * 2   # Grid Y dimension (pixels)
 DEFAULT_BEV_Z = 2     # Grid Z dimension (height levels)
 
 # Default BEV bounds in world units [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
-DEFAULT_BEV_BOUNDS = [0, 600, 0, 400, 0, 200]
+DEFAULT_BEV_BOUNDS = [0, 512 * 2, 0, 408 * 2, 0, 2]
 
 
 # ============================================================================

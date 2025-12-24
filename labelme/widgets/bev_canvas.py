@@ -69,7 +69,7 @@ class BEVCanvas(QtWidgets.QWidget):
         self.points: list[tuple] = []
         self.selected_point_idx: Optional[int] = None
         self.hovered_point_idx: Optional[int] = None
-        self.point_radius = 8  # radius in pixels
+        self.point_radius = 4  # radius in pixels
         
         # Dragging state for points
         self.dragging_point_idx: Optional[int] = None

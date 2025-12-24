@@ -27,7 +27,7 @@ shape:
   select_line_color: [255, 255, 255, 255]
   select_fill_color: [0, 255, 0, 64]
   hvertex_fill_color: [255, 255, 255, 255]
-  point_size: 8
+  point_size: 2
 
 ai:
   default: 'Sam2 (balanced)'
