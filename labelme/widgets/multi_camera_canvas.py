@@ -40,6 +40,7 @@ class MultiCameraCanvas(QtWidgets.QWidget):
     vertexSelected = QtCore.pyqtSignal(bool)
     mouseMoved = QtCore.pyqtSignal(QPointF)
     statusUpdated = QtCore.pyqtSignal(str)
+    setGlobalIdRequested = QtCore.pyqtSignal()  # Signal for double-click to set global ID
 
     mode: CanvasMode = CanvasMode.EDIT
     _createMode = "polygon"
@@ -906,7 +907,7 @@ class MultiCameraCanvas(QtWidgets.QWidget):
         self.update()
 
     def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
-        """Handle double-click to toggle fullscreen mode for a cell"""
+        """Handle double-click: set global ID if shapes are selected, otherwise toggle fullscreen"""
         if event.button() != Qt.LeftButton:
             return
         
@@ -923,6 +924,13 @@ class MultiCameraCanvas(QtWidgets.QWidget):
             self._move_start_pos = None
             self._move_start_cell_idx = None
         
+        # If shapes are selected, emit signal to set global ID
+        if self.selectedShapes:
+            # Emit signal for setting global ID
+            self.setGlobalIdRequested.emit()
+            return
+        
+        # Otherwise, toggle fullscreen mode
         pos = event.localPos()
         cell_info = self._get_cell_at_position(pos)
         

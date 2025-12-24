@@ -151,16 +151,22 @@ class PreprocessLabel:
         # Store frame BEV coordinates (centroids) for later access
         self.frame_bev_coords = {}  # {frame_idx: {frame_global_id: (x, y)}}
         
-    def preprocess(self, multi_camera_detections: Dict[str, List[List[List[float]]]]) -> Dict[Tuple[int, str, int], int]:
+    def preprocess(self, multi_camera_detections: Dict[str, List[List[List[float]]]], assign_global_ids: bool = False) -> Dict[Tuple[int, str, int], int]:
         """
-        Process multi-camera detections across frames to assign final global IDs
+        Process multi-camera detections across frames.
+        
+        If assign_global_ids=False (default): Only detect boxes, do not assign global IDs.
+        If assign_global_ids=True: Assign final global IDs to objects across multiple cameras and frames.
         
         Args:
             multi_camera_detections: Dict mapping camera_name -> list of frames,
                                    each frame is list of bboxes [x_min, y_min, x_max, y_max]
+            assign_global_ids: If True, assign global IDs using multiview matching and temporal tracking.
+                             If False, only return detections without ID assignment.
             
         Returns:
-            Dict mapping (frame_idx, camera_name, local_id) -> final_global_id
+            If assign_global_ids=True: Dict mapping (frame_idx, camera_name, local_id) -> final_global_id
+            If assign_global_ids=False: Empty dict (detections are stored but no IDs assigned)
         """
         if not multi_camera_detections:
             return {}
@@ -168,6 +174,14 @@ class PreprocessLabel:
         # Get number of frames from first camera
         camera_names = list(multi_camera_detections.keys())
         num_frames = len(multi_camera_detections[camera_names[0]])
+        
+        # If not assigning global IDs, just store detections and return empty dict
+        if not assign_global_ids:
+            # Store detections for later access (if needed)
+            self.multi_camera_detections = multi_camera_detections
+            self.final_global_id_map = {}
+            print(f"Detection completed. Found detections across {num_frames} frames. No global IDs assigned.")
+            return {}
         
         # Step 1: Multiview matching for each frame
         # frame_multiview_map: {frame_idx: {(camera_name, local_id): frame_global_id}}

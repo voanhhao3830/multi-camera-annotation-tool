@@ -645,6 +645,15 @@ class MainWindow(QtWidgets.QMainWindow):
             tip=self.tr("Modify the label of the selected polygon"),
             enabled=False,
         )
+        
+        setGlobalId = action(
+            self.tr("Set &Global ID"),
+            self._set_global_id,
+            None,
+            icon="tag.svg",
+            tip=self.tr("Set global ID for selected shapes (use Ctrl to select multiple)"),
+            enabled=False,
+        )
 
         fill_drawing = action(
             self.tr("Fill Drawing Polygon"),
@@ -709,6 +718,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             delete=delete,
             edit=edit,
+            setGlobalId=setGlobalId,
             duplicate=duplicate,
             copy=copy,
             paste=paste,
@@ -774,6 +784,7 @@ class MainWindow(QtWidgets.QMainWindow):
             *[draw_action for _, draw_action in self.draw_actions],
             editMode,
             edit,
+            setGlobalId,
             duplicate,
             copy,
             paste,
@@ -940,6 +951,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     delete,
                     undo,
                     brightnessContrast,
+                    None,
+                    setGlobalId,
                     None,
                     fitWindow,
                     zoom,
@@ -1322,9 +1335,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _switch_canvas_mode(
         self, edit: bool = True, createMode: str | None = None
     ) -> None:
-        self.canvas.setEditing(edit)
-        if createMode is not None:
-            self.canvas.createMode = createMode
+        # Handle both regular canvas and multi-camera canvas
+        if self.is_multi_camera_mode and self.multi_camera_canvas:
+            self.multi_camera_canvas.setEditing(edit)
+            if createMode is not None:
+                self.multi_camera_canvas.createMode = createMode
+        else:
+            self.canvas.setEditing(edit)
+            if createMode is not None:
+                self.canvas.createMode = createMode
+        
         if edit:
             for _, draw_action in self.draw_actions:
                 draw_action.setEnabled(True)
@@ -1365,6 +1385,82 @@ class MainWindow(QtWidgets.QMainWindow):
                     return True
         return False
 
+    def _set_global_id(self):
+        """Set global ID for selected shapes in multi-camera canvas"""
+        if not self.is_multi_camera_mode or not self.multi_camera_canvas:
+            return
+        
+        selected_shapes = self.multi_camera_canvas.selectedShapes
+        if not selected_shapes:
+            QMessageBox.warning(
+                self,
+                "Set Global ID",
+                "No shapes selected. Use Ctrl+Click to select multiple boxes from different cameras."
+            )
+            return
+        
+        # Get current group_id if all selected shapes have the same group_id
+        # Ignore -1 (unlabeled) when determining current group_id
+        current_group_id = None
+        if selected_shapes:
+            first_group_id = selected_shapes[0].group_id
+            if first_group_id != -1 and all(shape.group_id == first_group_id for shape in selected_shapes):
+                current_group_id = first_group_id
+        
+        # Show dialog to get new global ID
+        new_group_id, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Set Global ID",
+            f"Enter global ID for {len(selected_shapes)} selected shape(s):",
+            value=current_group_id if current_group_id is not None else self._get_next_group_id(),
+            min=0,
+            max=9999
+        )
+        
+        if not ok:
+            return
+        
+        # Store shapes for undo
+        if hasattr(self.multi_camera_canvas, 'storeShapes'):
+            self.multi_camera_canvas.storeShapes()
+        
+        # Update group_id for all selected shapes
+        for shape in selected_shapes:
+            shape.group_id = new_group_id
+            self._update_shape_color(shape)
+        
+        # Update label list items
+        for shape in selected_shapes:
+            item = self.labelList.findItemByShape(shape)
+            if item:
+                if shape.group_id is None or shape.group_id == -1:
+                    r, g, b = shape.fill_color.getRgb()[:3]
+                    item.setText(
+                        f"{html.escape(shape.label)} "
+                        f'<font color="#{r:02x}{g:02x}{b:02x}">●</font>'
+                    )
+                else:
+                    item.setText(f"{shape.label} ({shape.group_id})")
+        
+        # Refresh label list to show updated group IDs
+        self.labelList.update()
+        
+        # Sync BEV points
+        self._sync_bev_points_with_shapes()
+        
+        # Deselect all shapes after setting global ID
+        self.multi_camera_canvas.deSelectShape()
+        
+        # Update canvas
+        self.multi_camera_canvas.update()
+        self.setDirty()
+        
+        QMessageBox.information(
+            self,
+            "Set Global ID",
+            f"Global ID {new_group_id} has been assigned to {len(selected_shapes)} shape(s)."
+        )
+    
     def _edit_label(self, value=None):
         if not self.canvas.editing():
             return
@@ -1444,7 +1540,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 shape.description = description
 
             self._update_shape_color(shape)
-            if shape.group_id is None:
+            if shape.group_id is None or shape.group_id == -1:
                 r, g, b = shape.fill_color.getRgb()[:3]
                 item.setText(
                     f"{html.escape(shape.label)} "
@@ -1505,9 +1601,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.duplicate.setEnabled(n_selected)
         self.actions.copy.setEnabled(n_selected)
         self.actions.edit.setEnabled(n_selected)
+        # Enable setGlobalId only in multi-camera mode with selected shapes
+        self.actions.setGlobalId.setEnabled(n_selected > 0 and self.is_multi_camera_mode)
 
     def addLabel(self, shape):
-        if shape.group_id is None:
+        if shape.group_id is None or shape.group_id == -1:
             text = shape.label
         else:
             text = f"{shape.label} ({shape.group_id})"
@@ -1528,8 +1626,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_shape_color(self, shape):
-        if shape.group_id is not None:
+        if shape.group_id is not None and shape.group_id != -1:
             r, g, b = self._get_rgb_by_group_id(shape.group_id)
+        elif shape.group_id == -1:
+            # Unlabeled boxes (group_id = -1) have black color
+            r, g, b = 0, 0, 0
         else:
             r, g, b = self._get_rgb_by_label(shape.label)
         shape.line_color = QtGui.QColor(r, g, b)
@@ -2049,17 +2150,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         Ensure BEV points and 2D boxes are consistent:
         - Remove BEV points whose group_id không còn tồn tại ở bất kỳ box nào.
-        - Tự động tạo BEV point (ở vị trí mặc định) cho mọi group_id đang có box nhưng chưa có point.
+        - Note: BEV points are no longer auto-created from labeled boxes.
+        - BEV is now only for manual point placement -> project boxes to cameras.
         """
         if not self.bev_canvas or not self.multi_camera_canvas:
             return
 
-        # 1) Thu thập tất cả group_id đang có box trên multi-camera canvas
+        # 1) Thu thập tất cả group_id đang có box trên multi-camera canvas (bỏ qua -1)
         shape_group_ids = set()
         for cell in self.multi_camera_canvas.camera_cells:
             for shape in cell.shapes:
                 gid = getattr(shape, "group_id", None)
-                if gid is not None:
+                if gid is not None and gid != -1:
                     shape_group_ids.add(gid)
 
         # 2) Lọc bỏ các BEV point "mồ côi" (không còn box nào mang group_id đó)
@@ -2069,17 +2171,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 filtered_points.append((mem_x, mem_y, label, gid))
         self.bev_canvas.points = filtered_points
 
-        # 3) Thêm BEV point mặc định cho mọi group_id đang có box nhưng chưa có point.
-        #    Để tránh "dồn cục" ở giữa, mỗi group_id sẽ được đặt tại một vị trí
-        #    hơi lệch nhau quanh tâm (dựa trên group_id).
-        existing_point_ids = {
-            gid for _, _, _, gid in self.bev_canvas.points if gid is not None
-        }
-
-        for gid in shape_group_ids:
-            if gid not in existing_point_ids:
-                default_x, default_y = self._get_default_bev_point_position(gid)
-                self.bev_canvas.addPoint(default_x, default_y, "object", gid)
+        # 3) No longer auto-create BEV points from labeled boxes
+        # BEV points are only created manually by user clicking on BEV canvas
 
         # Cập nhật lại danh sách ground point
         self._update_ground_point_list()
@@ -2343,13 +2436,14 @@ class MainWindow(QtWidgets.QMainWindow):
             
             for person in annotations:
                 person_id = person.get("personID")
+                # If person_id is None or -1, set to -1 to indicate unlabeled box (black color)
+                if person_id is None or person_id == -1:
+                    person_id = -1
+                
                 # Prioritize 'ground_points' (grid coordinates) over 'coordinates' (world coordinates)
                 ground_points = person.get("ground_points")
                 views = person.get("views", [])
                 box_3d = person.get("box_3d")  # Load 3D box metadata if available
-                
-                if person_id is None:
-                    continue
                 
                 # Add 3D box on BEV if box_3d metadata is available
                 if self.bev_canvas and box_3d:
@@ -2382,19 +2476,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         import traceback
                         traceback.print_exc()
                 
-                # Add point (centroid) strictly from ground_points (output of preprocessing)
-                if self.bev_canvas and ground_points and len(ground_points) >= 2:
-                    # ground_points are world grid coordinates (grid_x, grid_y)
-                    grid_x = ground_points[0]
-                    grid_y = ground_points[1]
-                    # Check if ground_points are valid (positive values)
-                    if grid_x >= 0 and grid_y >= 0:
-                        # Transform to memory coordinates for BEV display
-                        mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
-                        # Add point to BEV canvas (each personID -> đúng 1 centroid)
-                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                        
                 # Add bounding boxes to camera views
+                # Note: BEV points are no longer auto-created from annotations
+                # BEV is now only for manual point placement -> project boxes to cameras
                 for view in views:
                     view_num = view.get("viewNum", -1)
                     xmin = view.get("xmin", -1)
@@ -2413,6 +2497,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                     
                     # Create rectangle shape for this camera view
+                    # person_id is already set to -1 if None or -1
                     shape = Shape(
                         label="object",
                         shape_type="rectangle",
@@ -2492,7 +2577,8 @@ class MainWindow(QtWidgets.QMainWindow):
             cell = self.multi_camera_canvas.camera_cells[camera_idx]
             
             for shape in cell.shapes:
-                if shape.group_id is None:
+                # Skip unlabeled boxes (group_id = -1)
+                if shape.group_id is None or shape.group_id == -1:
                     continue
                 
                 person_id = shape.group_id
@@ -2981,9 +3067,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 
                                 if max_view_num > 0:
                                     persons = []
-                                    person_id = 0
                                     
                                     # Create a person for each detection
+                                    # All boxes from model init have personID = -1 (unlabeled)
                                     for camera_id, detections in frame_detections_dict.items():
                                         view_num = camera_to_view.get(camera_id)
                                         if view_num is None:
@@ -2991,7 +3077,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                         
                                         for detection in detections:
                                             person = {
-                                                "personID": person_id,
+                                                "personID": -1,  # -1 means unlabeled, will be black
                                                 "ground_points": [-1, -1],
                                                 "views": []
                                             }
@@ -3016,7 +3102,6 @@ class MainWindow(QtWidgets.QMainWindow):
                                             }
                                             
                                             persons.append(person)
-                                            person_id += 1
                                     
                                     # Save to annotation file
                                     # Use actual_frame_idx (absolute index) for file naming
@@ -3167,142 +3252,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             
             # Preprocessing: 70-85 (or 50-85 if no YOLO)
+            # Now only detect boxes, do not assign global IDs
             current_progress = progress.value()
             progress.setValue(current_progress + 5)
             QtWidgets.QApplication.processEvents()
             
-            global_id_map = preprocessor.preprocess(multi_camera_detections)
+            # Only detect, do not assign global IDs
+            global_id_map = preprocessor.preprocess(multi_camera_detections, assign_global_ids=False)
             
             progress.setValue(85)
             QtWidgets.QApplication.processEvents()
             
-            # Convert results back to labelme format and save
-            # global_id_map: {(frame_idx, camera_name, local_id): final_global_id}
-            # annotation_to_local_id_map: {(frame_idx, cam_name, person_idx, view_idx): local_id}
-            # We need to update annotations with new personID (same logic as test_process_label.py)
-            
-            # Map each person to its final_global_id based on annotation_to_local_id_map
-            # IMPORTANT: All views of the same person must have the same personID
-            # Logic: Exactly same as test_process_label.py - for each person, collect all global_ids from all views,
-            # then assign the most common one (should be only one if multiview matching is correct)
-            for frame_idx in range(frame_count):
-                if frame_idx >= len(all_annotations):
-                    continue
-                
-                frame_data = all_annotations[frame_idx]
-                person_to_global_id = {}  # {person_idx: final_global_id}
-                
-                # Process each person exactly like test_process_label.py does
-                for person_idx, person in enumerate(frame_data):
-                    if not isinstance(person, dict):
-                        continue
-                    
-                    # Collect all global_ids from all views of this person
-                    # In test_process_label.py, each view gets its global_id individually
-                    # But for personID, we need to ensure all views have the same ID
-                    global_ids_for_person = []
-                    
-                    for view_idx, view in enumerate(person.get("views", [])):
-                        if not isinstance(view, dict):
-                            continue
-                        if view.get("xmin") == -1:
-                            continue
-                        
-                        view_num = view.get("viewNum")
-                        cam_name = VIEW_TO_CAMERA.get(view_num)
-                        
-                        if cam_name:
-                            # Get local_id from annotation_to_local_id_map (exactly like test_process_label.py line 718)
-                            local_id = annotation_to_local_id_map.get((frame_idx, cam_name, person_idx, view_idx), -1)
-                            
-                            if local_id >= 0:
-                                # Get global_id from mapping (exactly like test_process_label.py line 724)
-                                final_global_id = global_id_map.get((frame_idx, cam_name, local_id), -1)
-                                
-                                if final_global_id >= 0:
-                                    global_ids_for_person.append(final_global_id)
-                    
-                    # Assign the most common global_id to this person
-                    # If multiview matching worked correctly, all views should have the same global_id
-                    if global_ids_for_person:
-                        # Count occurrences of each global_id
-                        from collections import Counter
-                        global_id_counts = Counter(global_ids_for_person)
-                        # Get the most common global_id
-                        most_common_global_id, count = global_id_counts.most_common(1)[0]
-                        person_to_global_id[person_idx] = most_common_global_id
-                        
-                        # Warn if person has multiple different global_ids (indicates matching issue)
-                        if len(global_id_counts) > 1:
-                            logger.warning(f"Person {person_idx} in frame {frame_idx} has multiple global_ids: {dict(global_id_counts)}. Using most common: {most_common_global_id} (appears {count} times)")
-                
-                # Update personID for all persons in this frame
-                # All views of the same person will have the same personID
-                for person_idx, final_global_id in person_to_global_id.items():
-                    if person_idx < len(frame_data):
-                        # Convert numpy types to Python native types for JSON serialization
-                        frame_data[person_idx]["personID"] = int(final_global_id)
-            
-            # Get centroids from preprocessing and update ground_points
-            # Centroids are in BEV coordinates (memory coordinates), need to convert to world grid coordinates
-            centroids_by_final_id = preprocessor.get_centroids_by_final_id()
-            
-            # Update ground_points for each person based on cluster centroids
-            # Track which (frame_idx, person_id) pairs have been updated to avoid duplicates
-            updated_pairs = set()
-            
-            for frame_idx in range(frame_count):
-                if frame_idx >= len(all_annotations):
-                    continue
-                
-                frame_data = all_annotations[frame_idx]
-                
-                for person_idx, person in enumerate(frame_data):
-                    person_id = person.get("personID")
-                    if person_id is not None:
-                        # Only update once per (frame_idx, person_id) pair to avoid duplicates
-                        pair_key = (frame_idx, person_id)
-                        if pair_key in updated_pairs:
-                            continue
-                        
-                        # Get centroid for this person in this frame
-                        centroid_bev = centroids_by_final_id.get((frame_idx, person_id))
-                        if centroid_bev is not None:
-                            # Convert BEV coordinates (memory coordinates) to world grid coordinates
-                            # For now, BEV coordinates are already in world grid space (identity transform)
-                            # If transformation is needed, use self._mem_to_worldgrid() method
-                            mem_x, mem_y = centroid_bev[0], centroid_bev[1]
-                            
-                            # Convert to world grid coordinates
-                            # Note: Currently _mem_to_worldgrid returns identity, but should use proper transform if available
-                            grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
-                            
-                            # Update ground_points only for the first person with this personID in this frame
-                            frame_data[person_idx]["ground_points"] = [float(grid_x), float(grid_y)]
-                            updated_pairs.add(pair_key)
-            
-            # Save updated annotations
-            for frame_idx, annot_data in enumerate(all_annotations):
-                if frame_idx < len(annotation_files):
-                    annot_file = annotation_files[frame_idx]
-                    # Convert numpy types to Python native types for JSON serialization
-                    def convert_to_native(obj):
-                        """Recursively convert numpy types to Python native types"""
-                        if isinstance(obj, np.integer):
-                            return int(obj)
-                        elif isinstance(obj, np.floating):
-                            return float(obj)
-                        elif isinstance(obj, np.ndarray):
-                            return obj.tolist()
-                        elif isinstance(obj, dict):
-                            return {key: convert_to_native(value) for key, value in obj.items()}
-                        elif isinstance(obj, list):
-                            return [convert_to_native(item) for item in obj]
-                        return obj
-                    
-                    annot_data_serializable = convert_to_native(annot_data)
-                    with open(annot_file, 'w') as f:
-                        json.dump(annot_data_serializable, f, indent=4)
+            # Save annotations as-is (with detected boxes but no global IDs assigned)
+            # Detected boxes are already saved in annotation files from YOLO detection step
+            # No need to update personID or ground_points since we're not assigning global IDs
             
             progress.setValue(100)
             QtWidgets.QApplication.processEvents()
@@ -3313,7 +3276,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QMessageBox.information(
                 self,
                 "Preprocessing",
-                f"Preprocessing completed successfully!\nProcessed {frame_count} frames.\nUpdated {len(global_id_map)} mappings."
+                f"Detection completed successfully!\nProcessed {frame_count} frames.\nDetected boxes are ready for labeling.\nGlobal IDs can be assigned manually in the canvas."
             )
             
             # Reload current frame to show updated IDs
@@ -3413,7 +3376,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     shape = self.multi_camera_canvas.current
                     shape.label = text
                     shape.flags = flags
-                    shape.group_id = group_id
+                    # Use group_id from dialog, or -1 if None (unlabeled boxes have black color)
+                    shape.group_id = group_id if group_id is not None else -1
                     shape.description = description
                     
                     # Add shape to current cell
@@ -3425,15 +3389,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         cell.shapes.append(shape)
                         self.multi_camera_canvas.camera_cells[cell_idx] = cell
                         self.addLabel(shape)
-                        # Tự động tạo BEV point cho box mới nếu có group_id
-                        if self.bev_canvas and shape.group_id is not None:
-                            if not self.bev_canvas.getPointByGroupId(shape.group_id):
-                                default_x, default_y = self._get_default_bev_point_position(shape.group_id)
-                                self.bev_canvas.addPoint(default_x, default_y, shape.label, shape.group_id)
-                                self._update_ground_point_list()
+                        # Note: BEV points are no longer auto-created from labeled boxes
+                        # BEV is now only for manual point placement -> project boxes to cameras
                         self.multi_camera_canvas.current = None
                         self.multi_camera_canvas.current_cell_index = None
                         self.multi_camera_canvas.update()
+                        # Switch to edit mode after drawing
+                        self._switch_canvas_mode(edit=True)
                     else:
                         logger.warning("Shape is outside cell bounds, discarding")
                         self.multi_camera_canvas.current = None
@@ -3444,6 +3406,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 shape.group_id = group_id
                 shape.description = description
                 self.addLabel(shape)
+                # Switch to edit mode after drawing
+                self._switch_canvas_mode(edit=True)
             
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
@@ -4536,6 +4500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_camera_canvas.drawingPolygon.connect(self.toggleDrawingSensitive)
         self.multi_camera_canvas.mouseMoved.connect(self._update_status_stats)
         self.multi_camera_canvas.statusUpdated.connect(lambda text: self.status_left.setText(text))
+        self.multi_camera_canvas.setGlobalIdRequested.connect(self._set_global_id)
         
         # Replace canvas in scroll area
         scroll_area = self.centralWidget()
