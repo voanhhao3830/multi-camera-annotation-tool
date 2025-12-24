@@ -1,219 +1,208 @@
+from typing import Dict, List, Tuple, Optional
 import numpy as np
-import pandas as pd
-from typing import List, Tuple, Dict, Optional
 from scipy.optimize import linear_sum_assignment
-import trackpy as tp
+
+
+class _Kalman2D:
+    """
+    Constant-velocity Kalman filter in BEV (x, y, vx, vy).
+    Mirrors the lightweight tracker used in EarlyBird for BEV tracks.
+    """
+
+    def __init__(self, process_noise: float = 1.0, meas_noise: float = 0.5, dt: float = 1.0):
+        self.dt = dt
+        self.F = np.array(
+            [
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        self.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
+        q = process_noise
+        r = meas_noise
+        self.Q = np.eye(4, dtype=np.float32) * q
+        self.R = np.eye(2, dtype=np.float32) * r
+
+    def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mean = np.zeros((4,), dtype=np.float32)
+        mean[0:2] = measurement
+        cov = np.eye(4, dtype=np.float32)
+        return mean, cov
+
+    def predict(self, mean: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mean = self.F @ mean
+        cov = self.F @ cov @ self.F.T + self.Q
+        return mean, cov
+
+    def update(self, mean: np.ndarray, cov: np.ndarray, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        S = self.H @ cov @ self.H.T + self.R
+        K = cov @ self.H.T @ np.linalg.inv(S)
+        innovation = measurement - (self.H @ mean)
+        mean = mean + K @ innovation
+        cov = (np.eye(4, dtype=np.float32) - K @ self.H) @ cov
+        return mean, cov
+
+    def gating_distance(self, mean: np.ndarray, cov: np.ndarray, measurement: np.ndarray) -> float:
+        S = self.H @ cov @ self.H.T + self.R
+        diff = measurement - (self.H @ mean)
+        return float(diff.T @ np.linalg.inv(S) @ diff)
+
+
+class _Track:
+    def __init__(self, track_id: int, mean: np.ndarray, cov: np.ndarray):
+        self.id = track_id
+        self.mean = mean
+        self.cov = cov
+        self.age = 1
+        self.time_since_update = 0
+        self.hits = 1
+
+    def predict(self, kf: _Kalman2D):
+        self.mean, self.cov = kf.predict(self.mean, self.cov)
+        self.age += 1
+        self.time_since_update += 1
+
+    def update(self, kf: _Kalman2D, measurement: np.ndarray):
+        self.mean, self.cov = kf.update(self.mean, self.cov, measurement)
+        self.time_since_update = 0
+        self.hits += 1
+
+    @property
+    def position(self) -> Tuple[float, float]:
+        return float(self.mean[0]), float(self.mean[1])
+
+
+class EarlyBirdLikeTracker:
+    """
+    Simplified EarlyBird tracker in BEV space:
+    - Constant velocity Kalman filter
+    - Hungarian association with Mahalanobis gating
+    - Track lifecycle: max_age frames without update, min_hits to confirm
+    """
+
+    def __init__(
+        self,
+        max_distance: float = 9.0,
+        max_age: int = 10,
+        min_hits: int = 2,
+        process_noise: float = 1.0,
+        meas_noise: float = 0.5,
+        dt: float = 1.0,
+    ):
+        self.max_distance = max_distance  # gating distance (Mahalanobis squared)
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.kf = _Kalman2D(process_noise=process_noise, meas_noise=meas_noise, dt=dt)
+        self.tracks: List[_Track] = []
+        self._next_id = 0
+
+    def _associate(self, detections: np.ndarray) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        if not self.tracks or len(detections) == 0:
+            return [], list(range(len(self.tracks))), list(range(len(detections)))
+
+        cost = np.zeros((len(self.tracks), len(detections)), dtype=np.float32)
+        for t_idx, track in enumerate(self.tracks):
+            for d_idx, det in enumerate(detections):
+                cost[t_idx, d_idx] = self.kf.gating_distance(track.mean, track.cov, det)
+
+        row, col = linear_sum_assignment(cost)
+        matches: List[Tuple[int, int]] = []
+        unmatched_tracks = set(range(len(self.tracks)))
+        unmatched_dets = set(range(len(detections)))
+
+        for r, c in zip(row, col):
+            if cost[r, c] <= self.max_distance:
+                matches.append((r, c))
+                unmatched_tracks.discard(r)
+                unmatched_dets.discard(c)
+
+        return matches, list(unmatched_tracks), list(unmatched_dets)
+
+    def update(self, detections_xy: np.ndarray) -> List[Tuple[int, int]]:
+        """
+        Args:
+            detections_xy: array of shape [N, 2] containing (x, y) in BEV / world meters
+        Returns:
+            List of (det_idx, track_id) for the current frame (only confirmed assignments).
+        """
+        # Predict existing tracks
+        for track in self.tracks:
+            track.predict(self.kf)
+
+        matches, unmatched_tracks, unmatched_dets = self._associate(detections_xy)
+
+        # Update matched tracks
+        for t_idx, d_idx in matches:
+            self.tracks[t_idx].update(self.kf, detections_xy[d_idx])
+
+        # Create new tracks for unmatched detections
+        for d_idx in unmatched_dets:
+            mean, cov = self.kf.initiate(detections_xy[d_idx])
+            self.tracks.append(_Track(self._next_id, mean, cov))
+            self._next_id += 1
+
+        # Remove stale tracks
+        alive_tracks: List[_Track] = []
+        for track in self.tracks:
+            if track.time_since_update <= self.max_age:
+                alive_tracks.append(track)
+        self.tracks = alive_tracks
+
+        # Build output assignments (only for tracks that are "confirmed")
+        det_to_track: List[Tuple[int, int]] = []
+        for t_idx, d_idx in matches:
+            track = self.tracks[t_idx]
+            if track.hits >= self.min_hits or track.time_since_update == 0:
+                det_to_track.append((d_idx, track.id))
+        return det_to_track
 
 
 class ObjectTracking:
-    def __init__(self, list_of_labels: list[list[tuple[float, float]]], 
-                 max_distance: float = 50.0, search_range: float = None,
-                 use_hungarian: bool = True, velocity_smoothing: float = 0.3):
-        """
-        Args:
-            list_of_labels: List of frames, each frame is list of (x, y) coordinates
-            max_distance: Maximum distance for matching between frames (meters)
-            search_range: Search range for trackpy (if not using Hungarian)
-            use_hungarian: If True, use Hungarian algorithm for stable matching (recommended)
-            velocity_smoothing: Smoothing factor for velocity prediction (0.0 = no smoothing, 1.0 = full smoothing)
-        """
+    """
+    Drop-in replacement that runs an EarlyBird-style BEV Kalman + Hungarian tracker
+    on per-frame (x, y) detections. Input remains list_of_labels per frame.
+    """
+
+    def __init__(
+        self,
+        list_of_labels: List[List[Tuple[float, float]]],
+        max_distance: float = 9.0,
+        max_age: int = 10,
+        min_hits: int = 2,
+        process_noise: float = 1.0,
+        meas_noise: float = 0.5,
+        dt: float = 1.0,
+    ):
         self.list_of_labels = list_of_labels
-        self.global_id = {}  # {(frame_idx, obj_idx): global_id}
-        self.max_distance = max_distance
-        self.search_range = search_range if search_range is not None else max_distance
-        self.use_hungarian = use_hungarian
-        self.velocity_smoothing = velocity_smoothing
-        
-        # Track states: {track_id: {'pos': (x, y), 'vel': (vx, vy), 'last_frame': frame_idx}}
-        self.track_states = {}
-
-    def _prepare_dataframe(self) -> pd.DataFrame:
-        data = []
-        for frame_idx, frame_objects in enumerate(self.list_of_labels):
-            for obj_idx, (x, y) in enumerate(frame_objects):
-                data.append({
-                    'frame': frame_idx,
-                    'x': float(x),
-                    'y': float(y),
-                    'obj_idx': obj_idx
-                })
-        return pd.DataFrame(data)
-
-    def _predict_position(self, track_id: int, current_frame: int) -> Optional[Tuple[float, float]]:
-        """Predict next position based on velocity"""
-        if track_id not in self.track_states:
-            return None
-        
-        state = self.track_states[track_id]
-        if state['pos'] is None:
-            return None
-        
-        pos = state['pos']
-        vel = state.get('vel', (0.0, 0.0))
-        last_frame = state.get('last_frame', current_frame - 1)
-        
-        # Predict position based on velocity
-        frames_diff = current_frame - last_frame
-        if frames_diff > 0 and frames_diff <= 5:  # Only predict for reasonable frame gaps
-            predicted_x = pos[0] + vel[0] * frames_diff
-            predicted_y = pos[1] + vel[1] * frames_diff
-            return (predicted_x, predicted_y)
-        
-        return pos
-
-    def _update_velocity(self, track_id: int, new_pos: Tuple[float, float], current_frame: int):
-        """Update velocity estimate with smoothing"""
-        if track_id not in self.track_states:
-            return
-        
-        state = self.track_states[track_id]
-        old_pos = state.get('pos')
-        old_vel = state.get('vel', (0.0, 0.0))
-        last_frame = state.get('last_frame', current_frame - 1)
-        
-        if old_pos is not None and current_frame > last_frame:
-            frames_diff = current_frame - last_frame
-            if frames_diff > 0:
-                # Calculate instantaneous velocity
-                inst_vel = (
-                    (new_pos[0] - old_pos[0]) / frames_diff,
-                    (new_pos[1] - old_pos[1]) / frames_diff
-                )
-                # Smooth velocity: v_new = (1-α) * v_inst + α * v_old
-                smoothed_vel = (
-                    (1 - self.velocity_smoothing) * inst_vel[0] + self.velocity_smoothing * old_vel[0],
-                    (1 - self.velocity_smoothing) * inst_vel[1] + self.velocity_smoothing * old_vel[1]
-                )
-                state['vel'] = smoothed_vel
-        
-        state['pos'] = new_pos
-        state['last_frame'] = current_frame
-
-    def _hungarian_tracking(self) -> Dict[Tuple[int, int], int]:
-        """Track using Hungarian algorithm for stable matching"""
-        if not self.list_of_labels:
-            return {}
-        
-        temporal_map: Dict[Tuple[int, int], int] = {}
-        next_track_id = 0
-        
-        # Initialize with first frame
-        if len(self.list_of_labels) > 0:
-            first_dets = self.list_of_labels[0]
-            for det_idx, pos in enumerate(first_dets):
-                track_id = next_track_id
-                next_track_id += 1
-                self.track_states[track_id] = {
-                    'pos': pos,
-                    'vel': (0.0, 0.0),
-                    'last_frame': 0
-                }
-                temporal_map[(0, det_idx)] = track_id
-        
-        # Process subsequent frames
-        for frame_idx in range(1, len(self.list_of_labels)):
-            dets = self.list_of_labels[frame_idx]
-            if not dets:
-                # No detections, keep track states but don't update
-                continue
-            
-            # Get active tracks (tracks that appeared recently)
-            active_tracks = []
-            active_track_ids = []
-            for track_id, state in self.track_states.items():
-                last_frame = state.get('last_frame', frame_idx - 1)
-                # Consider track active if it appeared within last 3 frames
-                if frame_idx - last_frame <= 3:
-                    predicted_pos = self._predict_position(track_id, frame_idx)
-                    if predicted_pos is not None:
-                        active_tracks.append(predicted_pos)
-                        active_track_ids.append(track_id)
-            
-            if not active_tracks:
-                # No active tracks, assign new IDs to all detections
-                for det_idx, pos in enumerate(dets):
-                    track_id = next_track_id
-                    next_track_id += 1
-                    self.track_states[track_id] = {
-                        'pos': pos,
-                        'vel': (0.0, 0.0),
-                        'last_frame': frame_idx
-                    }
-                    temporal_map[(frame_idx, det_idx)] = track_id
-                continue
-            
-            # Build cost matrix: tracks x detections
-            cost = np.full((len(active_tracks), len(dets)), fill_value=self.max_distance * 10, dtype=np.float32)
-            for t_idx, track_pos in enumerate(active_tracks):
-                for d_idx, det_pos in enumerate(dets):
-                    dx = track_pos[0] - det_pos[0]
-                    dy = track_pos[1] - det_pos[1]
-                    dist = np.sqrt(dx * dx + dy * dy)
-                    cost[t_idx, d_idx] = dist
-            
-            # Hungarian assignment
-            row_ind, col_ind = linear_sum_assignment(cost)
-            
-            # Assign matches within max_distance
-            assigned_dets = set()
-            for t_idx, d_idx in zip(row_ind, col_ind):
-                if cost[t_idx, d_idx] <= self.max_distance:
-                    track_id = active_track_ids[t_idx]
-                    det_pos = dets[d_idx]
-                    self._update_velocity(track_id, det_pos, frame_idx)
-                    temporal_map[(frame_idx, d_idx)] = track_id
-                    assigned_dets.add(d_idx)
-            
-            # Unassigned detections: create new tracks
-            for det_idx, det_pos in enumerate(dets):
-                if det_idx not in assigned_dets:
-                    track_id = next_track_id
-                    next_track_id += 1
-                    self.track_states[track_id] = {
-                        'pos': det_pos,
-                        'vel': (0.0, 0.0),
-                        'last_frame': frame_idx
-                    }
-                    temporal_map[(frame_idx, det_idx)] = track_id
-        
-        return temporal_map
+        self.global_id: Dict[Tuple[int, int], int] = {}
+        self.tracker = EarlyBirdLikeTracker(
+            max_distance=max_distance,
+            max_age=max_age,
+            min_hits=min_hits,
+            process_noise=process_noise,
+            meas_noise=meas_noise,
+            dt=dt,
+        )
 
     def assign_global_id(self) -> Dict[Tuple[int, int], int]:
-        if not self.list_of_labels:
-            return {}
-        
-        if self.use_hungarian:
-            # Use Hungarian algorithm for stable tracking
-            self.global_id = self._hungarian_tracking()
-        else:
-            # Use trackpy (fallback)
-            df = self._prepare_dataframe()
-            
-            if df.empty:
-                return {}
-            
-            try:
-                linked = tp.link(df, search_range=self.search_range, memory=0)
-            except Exception as e:
-                print(f"Error in trackpy.link: {e}")
-                linked = tp.link_df(df, search_range=self.search_range, memory=0)
-            
-            self.global_id = {}
-            particle_to_global = {}
-            next_global_id = 0
-            
-            for _, row in linked.iterrows():
-                frame_idx = int(row['frame'])
-                obj_idx = int(row['obj_idx'])
-                particle_id = int(row['particle'])
-                
-                if particle_id not in particle_to_global:
-                    particle_to_global[particle_id] = next_global_id
-                    next_global_id += 1
-                
-                global_id = particle_to_global[particle_id]
-                self.global_id[(frame_idx, obj_idx)] = global_id
-        
+        """
+        Run the EarlyBird-like tracker and return mapping (frame_idx, obj_idx) -> global_id.
+        """
+        self.global_id = {}
+        for frame_idx, detections in enumerate(self.list_of_labels):
+            if len(detections) == 0:
+                # Even if no dets, still age tracks; prediction is done inside update.
+                detections_xy = np.empty((0, 2), dtype=np.float32)
+            else:
+                detections_xy = np.array(detections, dtype=np.float32)
+
+            assignments = self.tracker.update(detections_xy)
+            for det_idx, track_id in assignments:
+                self.global_id[(frame_idx, det_idx)] = track_id
+
         return self.global_id
 
     def get_global_id(self, frame_idx: int, obj_idx: int) -> int:
