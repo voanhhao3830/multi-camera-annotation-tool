@@ -109,6 +109,10 @@ class MultiCameraCanvas(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.WheelFocus)
         
+        # Temporary projection markers: dict[camera_id] -> (x, y) or None
+        # Used to show where BEV mouse position projects to on each camera
+        self._bev_projection_markers: dict[str, QPointF | None] = {}
+        
         # Menus
         self.menus = (QtWidgets.QMenu(), QtWidgets.QMenu())
 
@@ -327,6 +331,16 @@ class MultiCameraCanvas(QtWidgets.QWidget):
                 cell_rect=cell_rect,
                 image_rect=image_rect,
             )
+    
+    def setBEVProjectionMarkers(self, markers: dict[str, QPointF | None]):
+        """
+        Set temporary projection markers showing where BEV mouse position projects to on each camera.
+        
+        Args:
+            markers: dict mapping camera_id to (x, y) pixel coordinates or None
+        """
+        self._bev_projection_markers = markers.copy()
+        self.update()
 
     def paintEvent(self, a0: QtGui.QPaintEvent) -> None:
         if not self.camera_cells:
@@ -443,6 +457,45 @@ class MultiCameraCanvas(QtWidgets.QWidget):
                     
                     # Restore original points
                     shape_copy.points = original_points
+            
+            # Draw BEV projection markers (temporary markers showing where BEV mouse projects to)
+            if cell.camera_id in self._bev_projection_markers:
+                marker_pos = self._bev_projection_markers[cell.camera_id]
+                if marker_pos is not None and cell.image.width() > 0 and cell.image.height() > 0:
+                    # Check if marker is within image bounds (in cell/image coordinates)
+                    if (0 <= marker_pos.x() < cell.image.width() and 
+                        0 <= marker_pos.y() < cell.image.height()):
+                        # Convert marker position (in cell/image coordinates) to global coordinates
+                        global_marker = self._cell_to_global_coords(marker_pos, cell)
+                        
+                        # Double-check if marker is within image rect bounds
+                        if cell.image_rect.contains(global_marker):
+                            # Draw a crosshair/circle marker
+                            marker_size = 8
+                            p.setPen(QtGui.QPen(QtGui.QColor(255, 0, 255), 2))  # Magenta color
+                            p.setBrush(QtCore.Qt.NoBrush)
+                            
+                            # Draw crosshair
+                            p.drawLine(
+                                int(global_marker.x() - marker_size),
+                                int(global_marker.y()),
+                                int(global_marker.x() + marker_size),
+                                int(global_marker.y())
+                            )
+                            p.drawLine(
+                                int(global_marker.x()),
+                                int(global_marker.y() - marker_size),
+                                int(global_marker.x()),
+                                int(global_marker.y() + marker_size)
+                            )
+                            
+                            # Draw circle around marker
+                            p.drawEllipse(
+                                int(global_marker.x() - marker_size),
+                                int(global_marker.y() - marker_size),
+                                marker_size * 2,
+                                marker_size * 2
+                            )
         
         # Draw crosshair when drawing (like default Canvas)
         # Crosshair should be drawn after images but before shapes (like Canvas default)
@@ -626,6 +679,15 @@ class MultiCameraCanvas(QtWidgets.QWidget):
             if Qt.LeftButton & a0.buttons():
                 # Handle dragging for moving shapes/vertices
                 if self.movingVertex and self.hShape and self.hVertex is not None:
+                    # Check if shape is locked - locked shapes cannot be edited
+                    is_locked = getattr(self.hShape, '_bev_locked', False)
+                    if is_locked:
+                        # Stop moving if shape is locked
+                        self.movingVertex = False
+                        self.hShape = None
+                        self.hVertex = None
+                        return
+                    
                     # Moving vertex
                     new_pos = cell_pos
                     new_pos = self._constrain_point_to_cell(new_pos, cell)
@@ -643,6 +705,17 @@ class MultiCameraCanvas(QtWidgets.QWidget):
                     self.shapeMoved.emit()
                     self.repaint()
                 elif self.movingShape and self.selectedShapes and self._move_start_pos is not None and self._move_start_cell_idx is not None:
+                    # Check if any selected shape is locked - locked shapes cannot be moved
+                    has_locked = any(getattr(shape, '_bev_locked', False) for shape in self.selectedShapes)
+                    if has_locked:
+                        # Stop moving if any shape is locked
+                        self.movingShape = False
+                        self.selectedShapes = []
+                        self.selectedShapesCopy = []
+                        self._move_start_pos = None
+                        self._move_start_cell_idx = None
+                        return
+                    
                     # Moving selected shapes
                     if self._move_start_cell_idx == cell_idx:
                         # Calculate offset
@@ -960,14 +1033,54 @@ class MultiCameraCanvas(QtWidgets.QWidget):
         cell_pos = self._global_to_cell_coords(pos, cell)
         cell_pos = self._constrain_point_to_cell(cell_pos, cell)
         
+        # Set current_cell_index so editing works immediately after zoom to fullscreen
+        self.current_cell_index = cell_idx
+        
+        # Set prevPoint and prevMovePoint so mouse move events work correctly
+        self.prevPoint = cell_pos
+        self.prevMovePoint = cell_pos
+        
         # Clear previous hover state first and restore cursor
         self.unHighlight()
         
         # Update hover state with current mouse position
         self._update_hover_shape(cell_pos, cell)
         
-        # Don't reset flag here - let mousePressEvent handle it
-        # This ensures hover state is updated but click is skipped
+        # Reset double-click flag immediately so next click/drag works right away
+        # This allows immediate editing after zoom to fullscreen
+        self._is_double_click = False
+        
+        # If there's a hovered shape and mouse button is still pressed (user is dragging),
+        # set up moving state immediately so box can be dragged right away
+        if self.hShape and self.mode == CanvasMode.EDIT:
+            # Check if shape is locked - locked shapes cannot be edited
+            is_locked = getattr(self.hShape, '_bev_locked', False)
+            if not is_locked:
+                # Pre-select the shape so it can be dragged immediately
+                if self.hShape not in self.selectedShapes:
+                    # Clear previous selections
+                    for s in self.selectedShapes:
+                        s.selected = False
+                    self.selectedShapes = [self.hShape]
+                    self.hShape.selected = True
+                    self.selectionChanged.emit(self.selectedShapes)
+                
+                # If mouse button is still pressed (user is dragging after double-click),
+                # set up moving state immediately
+                if event.buttons() & Qt.LeftButton:
+                    if self.hVertex is not None:
+                        # Start moving vertex
+                        self.movingVertex = True
+                        self.movingShape = False
+                        self._move_start_pos = cell_pos
+                        self._move_start_cell_idx = cell_idx
+                    elif self.hShape.containsPoint(cell_pos):
+                        # Start moving shape
+                        self.movingShape = True
+                        self.movingVertex = False
+                        self._move_start_pos = cell_pos
+                        self._move_start_cell_idx = cell_idx
+                        self.storeShapes()
         
         self.update()
 
@@ -1035,6 +1148,13 @@ class MultiCameraCanvas(QtWidgets.QWidget):
         is_control = event.modifiers() & Qt.ControlModifier
         
         if self.hShape:
+            # Check if shape is locked - locked shapes cannot be edited
+            is_locked = getattr(self.hShape, '_bev_locked', False)
+            
+            if is_locked:
+                # Shape is locked, don't allow editing
+                return
+            
             if self.hVertex is not None:
                 # Start moving vertex
                 self.movingVertex = True

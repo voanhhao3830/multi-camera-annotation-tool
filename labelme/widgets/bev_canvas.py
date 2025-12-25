@@ -37,6 +37,8 @@ class BEVCanvas(QtWidgets.QWidget):
     pointDoubleClicked = QtCore.pyqtSignal(int, object)  # point_idx, group_id (for editing)
     pointDeleted = QtCore.pyqtSignal(object)  # group_id
     pointMoved = QtCore.pyqtSignal(object, float, float)  # group_id, new_x, new_y
+    pointLocked = QtCore.pyqtSignal(object, bool)  # group_id, locked (True = locked, False = unlocked)
+    mousePositionChanged = QtCore.pyqtSignal(float, float)  # x, y (grid coordinates) - for real-time projection
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,6 +72,10 @@ class BEVCanvas(QtWidgets.QWidget):
         self.selected_point_idx: Optional[int] = None
         self.hovered_point_idx: Optional[int] = None
         self.point_radius = 4  # radius in pixels
+        
+        # Track locked state for each point by group_id
+        # Locked points are "chốt label" - cannot be edited and shown in black color
+        self.points_locked: dict[Optional[int], bool] = {}  # group_id -> locked (True/False)
         
         # Dragging state for points
         self.dragging_point_idx: Optional[int] = None
@@ -216,6 +222,7 @@ class BEVCanvas(QtWidgets.QWidget):
     def clearPoints(self):
         """Clear all points"""
         self.points = []
+        self.points_locked = {}
         self.selected_point_idx = None
         self.hovered_point_idx = None
         self.update()
@@ -225,6 +232,9 @@ class BEVCanvas(QtWidgets.QWidget):
         for i, (x, y, label, gid) in enumerate(self.points):
             if gid == group_id:
                 self.points.pop(i)
+                # Remove locked state if exists
+                if group_id in self.points_locked:
+                    del self.points_locked[group_id]
                 if self.selected_point_idx == i:
                     self.selected_point_idx = None
                 elif self.selected_point_idx is not None and self.selected_point_idx > i:
@@ -232,6 +242,28 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.update()
                 return True
         return False
+    
+    def setPointLocked(self, group_id: Optional[int], locked: bool, emit_signal: bool = True):
+        """Set locked state for a point by group_id
+        
+        Args:
+            group_id: Group ID of the point
+            locked: True to lock, False to unlock
+            emit_signal: If True, emit pointLocked signal (default True)
+        """
+        if group_id is None:
+            return
+        self.points_locked[group_id] = locked
+        self.update()
+        # Emit signal to notify (unless loading from file)
+        if emit_signal:
+            self.pointLocked.emit(group_id, locked)
+    
+    def isPointLocked(self, group_id: Optional[int]) -> bool:
+        """Check if a point is locked by group_id"""
+        if group_id is None:
+            return False
+        return self.points_locked.get(group_id, False)
 
     def updatePoint(self, point_idx: int, x: Optional[float] = None, y: Optional[float] = None, 
                    label: Optional[str] = None, group_id: Optional[int] = None) -> bool:
@@ -520,22 +552,29 @@ class BEVCanvas(QtWidgets.QWidget):
         for idx, (x, y, label, group_id) in enumerate(self.points):
             screen_pos = self._grid_to_screen(x, y)
             
-            # Determine color based on group_id for consistency with camera views
-            if group_id is not None:
-                # Use same colormap as app.py for consistent colors
-                r, g, b = self._get_rgb_by_group_id(group_id)
-                color = QtGui.QColor(r, g, b)
-                # Debug: log color for first point only to avoid spam
-                # if idx == 0:
-                    # logger.debug(f"BEV paintEvent: point[{idx}] group_id={group_id}, color=RGB({r},{g},{b})")
-            else:
-                color = self.box_color
+            # Check if point is locked - locked points are always black
+            is_locked = self.isPointLocked(group_id)
             
-            # Check if selected or hovered (override color)
-            if idx == self.selected_point_idx:
-                color = self.selected_box_color
-            elif idx == self.hovered_point_idx:
-                color = self.hovered_box_color
+            if is_locked:
+                # Locked points are drawn in black
+                color = QtGui.QColor(0, 0, 0)  # Black color for locked points
+            else:
+                # Determine color based on group_id for consistency with camera views
+                if group_id is not None:
+                    # Use same colormap as app.py for consistent colors
+                    r, g, b = self._get_rgb_by_group_id(group_id)
+                    color = QtGui.QColor(r, g, b)
+                    # Debug: log color for first point only to avoid spam
+                    # if idx == 0:
+                        # logger.debug(f"BEV paintEvent: point[{idx}] group_id={group_id}, color=RGB({r},{g},{b})")
+                else:
+                    color = self.box_color
+                
+                # Check if selected or hovered (override color, but not for locked)
+                if idx == self.selected_point_idx:
+                    color = self.selected_box_color
+                elif idx == self.hovered_point_idx:
+                    color = self.hovered_box_color
             
             # Draw filled circle
             p.setPen(QtGui.QPen(color, 2))
@@ -586,10 +625,18 @@ class BEVCanvas(QtWidgets.QWidget):
             # First check if clicking on existing point - start dragging
             point_idx = self._get_point_at_position(pos)
             if point_idx is not None:
+                _, _, _, group_id = self.points[point_idx]
+                # Check if point is locked - locked points cannot be dragged
+                if self.isPointLocked(group_id):
+                    # Point is locked, don't allow dragging
+                    self.selected_point_idx = point_idx
+                    self.pointSelected.emit(group_id)
+                    self.update()
+                    return
+                
                 self.selected_point_idx = point_idx
                 self.dragging_point_idx = point_idx  # Start dragging
                 self.drag_start_pos = pos
-                _, _, _, group_id = self.points[point_idx]
                 self.pointSelected.emit(group_id)
                 self.update()
                 return
@@ -612,6 +659,9 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.selected_point_idx = point_idx
                 _, _, _, group_id = self.points[point_idx]
                 self.pointSelected.emit(group_id)
+                
+                # Show context menu
+                self._show_point_context_menu(event.globalPos(), group_id)
                 self.update()
                 return
             
@@ -630,8 +680,13 @@ class BEVCanvas(QtWidgets.QWidget):
             # First check points
             point_idx = self._get_point_at_position(pos)
             if point_idx is not None:
-                self.selected_point_idx = point_idx
                 _, _, _, group_id = self.points[point_idx]
+                # Check if point is locked - locked points cannot be edited
+                if self.isPointLocked(group_id):
+                    # Point is locked, don't allow editing
+                    return
+                
+                self.selected_point_idx = point_idx
                 self.pointDoubleClicked.emit(point_idx, group_id)
                 self.update()
                 return
@@ -652,6 +707,14 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Handle point dragging
         if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
+            _, _, _, group_id = self.points[self.dragging_point_idx]
+            # Check if point is locked - locked points cannot be dragged
+            if self.isPointLocked(group_id):
+                # Stop dragging if point is locked
+                self.dragging_point_idx = None
+                self.drag_start_pos = None
+                return
+            
             # Get grid coordinates for new position
             new_x, new_y = self._screen_to_grid(pos)
             
@@ -690,6 +753,15 @@ class BEVCanvas(QtWidgets.QWidget):
         # Update tooltip with grid coordinates
         x, y = self._screen_to_grid(pos)
         self.setToolTip(f"Grid X: {x:.1f}, Grid Y: {y:.1f}")
+        
+        # Emit mouse position for real-time projection to cameras
+        self.mousePositionChanged.emit(x, y)
+    
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        """Handle mouse leave event - clear projection markers"""
+        # Emit None, None to clear markers
+        self.mousePositionChanged.emit(float('nan'), float('nan'))
+        super().leaveEvent(event)
     
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         """Handle mouse release"""
@@ -722,6 +794,11 @@ class BEVCanvas(QtWidgets.QWidget):
             point_idx_to_delete = self.selected_point_idx
             if point_idx_to_delete is not None and 0 <= point_idx_to_delete < len(self.points):
                 _, _, _, group_id = self.points[point_idx_to_delete]
+                
+                # Check if point is locked - locked points cannot be deleted
+                if self.isPointLocked(group_id):
+                    # Point is locked, don't allow deletion
+                    return
                 
                 # Reset selection state BEFORE emitting signal (signal handler might modify state)
                 self.selected_point_idx = None
@@ -762,6 +839,13 @@ class BEVCanvas(QtWidgets.QWidget):
         # Handle point movement with arrow keys
         if self.selected_point_idx is not None and 0 <= self.selected_point_idx < len(self.points):
             x, y, label, group_id = self.points[self.selected_point_idx]
+            
+            # Check if point is locked - locked points cannot be moved
+            if self.isPointLocked(group_id):
+                # Point is locked, don't allow movement
+                super().keyPressEvent(event)
+                return
+            
             new_x, new_y = x, y
             moved = False
             
@@ -848,4 +932,29 @@ class BEVCanvas(QtWidgets.QWidget):
                 new_size[2] = d
             self.boxes_3d[box_idx] = (new_center, new_size, rotation, label, group_id)
             self.update()
+    
+    def _show_point_context_menu(self, global_pos: QPointF, group_id: Optional[int]):
+        """Show context menu for a point when right-clicked"""
+        if group_id is None:
+            return
+        
+        menu = QtWidgets.QMenu(self)
+        
+        # Check if point is currently locked
+        is_locked = self.isPointLocked(group_id)
+        
+        if is_locked:
+            # If locked, show option to unlock
+            unlock_action = menu.addAction("Unlock label")
+            action = menu.exec_(global_pos)
+            
+            if action == unlock_action:
+                self.setPointLocked(group_id, False)
+        else:
+            # If not locked, show option to lock
+            lock_action = menu.addAction("Lock label")
+            action = menu.exec_(global_pos)
+            
+            if action == lock_action:
+                self.setPointLocked(group_id, True)
 

@@ -1520,7 +1520,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_shape_color(self, shape):
-        if shape.group_id is not None:
+        # Check if shape is locked (chốt label) - locked shapes are black
+        is_locked = getattr(shape, '_bev_locked', False)
+        
+        if is_locked:
+            # Locked shapes are always black
+            r, g, b = 0, 0, 0
+        elif shape.group_id is not None:
             r, g, b = self._get_rgb_by_group_id(shape.group_id)
         else:
             r, g, b = self._get_rgb_by_label(shape.label)
@@ -2270,6 +2276,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ground_points = person.get("ground_points")
                 views = person.get("views", [])
                 box_3d = person.get("box_3d")  # Load 3D box metadata if available
+                locked = person.get("locked", False)  # Load locked state
                 
                 if person_id is None:
                     continue
@@ -2306,6 +2313,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             # IMPORTANT: Also add point (centroid) for this person
                             # Point represents the centroid of the cluster, which is required
                             self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                            # Restore locked state if available (don't emit signal during load)
+                            if locked:
+                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
                             point_added_to_bev = True
                             
                     except Exception as box_e:
@@ -2326,6 +2336,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
                             # Add point to BEV canvas (not a box)
                             self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                            # Restore locked state if available (don't emit signal during load)
+                            if locked:
+                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
                             point_added_to_bev = True
                     
                     # If still no point added, try to compute from views or use default position
@@ -2363,6 +2376,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                                 if bev_coords:
                                                     mem_x, mem_y = bev_coords
                                                     self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                                    # Restore locked state if available (don't emit signal during load)
+                                                    if locked:
+                                                        self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
                                                     point_added_to_bev = True
                                                     logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
                                                     break
@@ -2375,6 +2391,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             default_x = self._bev_x / 2.0 if hasattr(self, '_bev_x') else 600.0
                             default_y = self._bev_y / 2.0 if hasattr(self, '_bev_y') else 400.0
                             self.bev_canvas.addPoint(default_x, default_y, "object", person_id)
+                            # Restore locked state if available (don't emit signal during load)
+                            if locked:
+                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
                             logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
                         
                 # Add bounding boxes to camera views
@@ -2407,6 +2426,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Update shape color based on group_id
                     self._update_shape_color(shape)
+                    
+                    # Restore locked state on shape if available
+                    if locked:
+                        shape._bev_locked = True
+                        self._update_shape_color(shape)
                     
                     # Add to the corresponding camera cell
                     cell = self.multi_camera_canvas.camera_cells[camera_idx]
@@ -2485,7 +2509,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     persons[person_id] = {
                         "personID": person_id,
                         "ground_points": [-1, -1],  # Will be updated from BEV if available (grid coordinates)
-                        "views": []
+                        "views": [],
+                        "locked": False  # Will be updated from BEV if available
                     }
                     # Initialize all views with -1 (viewNum is 1-indexed to match AICV format)
                     for view_num in range(1, len(self.multi_camera_data) + 1):
@@ -2515,7 +2540,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "ymax": ymax
                     }
         
-        # Update ground_points from BEV points if available
+        # Update ground_points and locked state from BEV points if available
         # BEV points are in memory coordinates, need to convert back to world grid
         if self.bev_canvas and self.bev_canvas.points:
             for mem_x, mem_y, label, group_id in self.bev_canvas.points:
@@ -2523,6 +2548,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     # Convert memory coordinates back to world grid coordinates
                     grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
                     persons[group_id]["ground_points"] = [grid_x, grid_y]
+                    # Update locked state
+                    persons[group_id]["locked"] = self.bev_canvas.isPointLocked(group_id)
         
         # Update 3D bounding box information from BEV boxes if available
         # Store x, y, z (center position) and w, h, d (box dimensions)
@@ -4729,6 +4756,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bev_canvas.pointDoubleClicked.connect(self._on_bev_point_double_clicked)
         self.bev_canvas.pointDeleted.connect(self._on_bev_point_deleted)
         self.bev_canvas.pointMoved.connect(self._on_bev_point_moved)
+        self.bev_canvas.pointLocked.connect(self._on_bev_point_locked)
+        self.bev_canvas.mousePositionChanged.connect(self._on_bev_mouse_position_changed)
         
         # Create dock widget for BEV with step size control
         bev_dock = QtWidgets.QDockWidget("BEV View (3D Box Placement)", self)
@@ -5130,6 +5159,93 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_camera_canvas.update()
         self._update_ground_point_list()
         self.setDirty()
+    
+    def _on_bev_mouse_position_changed(self, x: float, y: float):
+        """Handle BEV mouse position change - project to all cameras in real-time"""
+        if not self.multi_camera_canvas or not self.multi_camera_data or not self.camera_calibrations:
+            return
+        
+        # Check if mouse left BEV (NaN values indicate mouse left)
+        if np.isnan(x) or np.isnan(y):
+            # Clear all markers
+            markers = {cam_data.get("camera_id", f"Camera{i}"): None 
+                      for i, cam_data in enumerate(self.multi_camera_data)}
+            self.multi_camera_canvas.setBEVProjectionMarkers(markers)
+            return
+        
+        # Convert grid coordinates (mem coordinates) to projection
+        mem_point = np.array([[x, y]], dtype=np.float32)
+        
+        # Dictionary to store projection markers for each camera
+        markers = {}
+        
+        # Project to each camera
+        for cam_idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data.get("camera_id", f"Camera{cam_idx}")
+            calibration = self.camera_calibrations.get(camera_id)
+            
+            if not calibration:
+                markers[camera_id] = None
+                continue
+            
+            # Project the BEV mouse position to this camera
+            try:
+                projected = calibration.project_mem_to_2d(
+                    mem_point,
+                    bev_x=self._bev_x,
+                    bev_y=self._bev_y,
+                    bev_bounds=self._bev_bounds,
+                    apply_distortion=True
+                )
+                
+                if projected is None or np.isnan(projected).any():
+                    markers[camera_id] = None
+                    continue
+                
+                proj_x, proj_y = projected[0]
+                
+                # Check if projection is within image bounds
+                cell = self.multi_camera_canvas.camera_cells[cam_idx] if cam_idx < len(self.multi_camera_canvas.camera_cells) else None
+                if cell and cell.image.width() > 0 and cell.image.height() > 0:
+                    # Check if within image bounds
+                    if 0 <= proj_x < cell.image.width() and 0 <= proj_y < cell.image.height():
+                        # Store marker position in cell/image coordinates
+                        markers[camera_id] = QtCore.QPointF(proj_x, proj_y)
+                    else:
+                        markers[camera_id] = None
+                else:
+                    markers[camera_id] = None
+                    
+            except Exception as e:
+                logger.debug(f"Failed to project BEV mouse position to camera {camera_id}: {e}")
+                markers[camera_id] = None
+        
+        # Update markers in multi-camera canvas
+        self.multi_camera_canvas.setBEVProjectionMarkers(markers)
+    
+    def _on_bev_point_locked(self, group_id: Optional[int], locked: bool):
+        """Handle point lock/unlock - update box colors on camera views"""
+        if group_id is None or not self.multi_camera_canvas:
+            return
+        
+        # Update color of all shapes with matching group_id
+        for cell in self.multi_camera_canvas.camera_cells:
+            for shape in cell.shapes:
+                if shape.group_id == group_id:
+                    # Set locked attribute on shape
+                    shape._bev_locked = locked
+                    # Update shape color
+                    self._update_shape_color(shape)
+        
+        # Update canvas to show changes
+        self.multi_camera_canvas.update()
+        
+        # Mark as dirty to trigger save (so locked state is saved)
+        self.setDirty()
+        
+        # Also directly save global annotations to ensure locked state is saved immediately
+        # This ensures that even if only lock/unlock is done, the state is saved
+        self._save_global_annotations()
     
     def _project_3d_box_to_cameras(self, x: float, y: float, z: float, 
                                    w: float, h: float, d: float,
