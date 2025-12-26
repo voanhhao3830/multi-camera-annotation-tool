@@ -2408,10 +2408,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     if xmin < 0 or ymin < 0 or xmax < 0 or ymax < 0:
                         continue
                     
-                    # viewNum is 1-indexed in AICV format, convert to 0-indexed
-                    camera_idx = view_num - 1
+                    # Map viewNum to camera_id, then find correct index in multi_camera_data
+                    # viewNum is 1-indexed: viewNum=3 -> Camera3
+                    VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+                    camera_id_from_view = VIEW_TO_CAMERA.get(view_num)
                     
-                    if camera_idx < 0 or camera_idx >= len(self.multi_camera_canvas.camera_cells):
+                    if not camera_id_from_view:
+                        continue
+                    
+                    # Find camera index in multi_camera_data by matching camera_id
+                    camera_idx = None
+                    for idx, cam_data in enumerate(self.multi_camera_data):
+                        if cam_data.get("camera_id") == camera_id_from_view:
+                            camera_idx = idx
+                            break
+                    
+                    if camera_idx is None or camera_idx < 0 or camera_idx >= len(self.multi_camera_canvas.camera_cells):
                         continue
                     
                     # Create rectangle shape for this camera view
@@ -2910,164 +2922,57 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Run YOLO detection
                     try:
-                        from ultralytics import YOLO
-                        import cv2
+                        from labelme.utils.yolo_detection import run_yolo_detection_return_dict, run_yolo_detection
                         
-                        logger.info(f"Loading YOLO model from {model_path}")
-                        yolo_model = YOLO(model_path)
+                        # Progress callback function
+                        def update_progress(value):
+                            progress.setValue(value)
+                            QtWidgets.QApplication.processEvents()
                         
-                        # Helper function to convert camera_id to viewNum
-                        def camera_id_to_view_num(camera_id):
-                            # Camera1 -> 1, Camera2 -> 2, etc.
-                            try:
-                                return int(camera_id.replace("Camera", ""))
-                            except:
-                                return None
+                        # Get conf_threshold from settings
+                        conf_threshold = settings.get("conf_threshold", 0.5)
                         
-                        # Process each frame
-                        # frame_idx is relative to sliced range (0 to frame_count-1)
-                        # actual_frame_idx is absolute index in original annotation files (start_frame to end_frame-1)
-                        detections_created = 0
-                        for frame_idx in range(frame_count):
-                            actual_frame_idx = start_frame + frame_idx
-                            if frame_idx % 10 == 0:
-                                # YOLO detection: 45-70 (25% range)
-                                progress.setValue(45 + int(25 * frame_idx / frame_count))
-                                QtWidgets.QApplication.processEvents()
-                            
-                            frame_detections_dict = {}
-                            camera_data_for_frame = []
-                            
-                            # Load images from all cameras for this frame
-                            for cam_folder in camera_folders:
-                                cam_path = os.path.join(image_subsets_folder, cam_folder)
-                                if os.path.isdir(cam_path):
-                                    image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
-                                                       glob.glob(os.path.join(cam_path, "*.png")) + 
-                                                       glob.glob(os.path.join(cam_path, "*.jpeg")))
-                                    if actual_frame_idx < len(image_files):
-                                        image_path = image_files[actual_frame_idx]
-                                        camera_id = f"Camera{cam_folder}"
-                                        
-                                        # Load image and run YOLO
-                                        image = cv2.imread(image_path)
-                                        if image is not None:
-                                            # Use conf_threshold from settings
-                                            conf_threshold = settings.get("conf_threshold", 0.5)
-                                            results = yolo_model(image, verbose=False, conf=conf_threshold)
-                                            
-                                            # Extract detections
-                                            detections = []
-                                            for result in results:
-                                                boxes = result.boxes
-                                                for box in boxes:
-                                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                                                    detections.append({
-                                                        "xmin": int(x1),
-                                                        "ymin": int(y1),
-                                                        "xmax": int(x2),
-                                                        "ymax": int(y2),
-                                                        "confidence": float(box.conf[0].cpu().numpy()),
-                                                        "class": int(box.cls[0].cpu().numpy())
-                                                    })
-                                            
-                                            frame_detections_dict[camera_id] = detections
-                                            camera_data_for_frame.append({
-                                                "camera_id": camera_id,
-                                                "image_path": image_path
-                                            })
-                            
-                            # Save detections to annotation file
-                            if frame_detections_dict:
-                                # Build camera to viewNum mapping
-                                camera_to_view = {}
-                                for cam_data in camera_data_for_frame:
-                                    camera_id = cam_data["camera_id"]
-                                    view_num = camera_id_to_view_num(camera_id)
-                                    if view_num:
-                                        camera_to_view[camera_id] = view_num
-                                
-                                max_view_num = max(camera_to_view.values()) if camera_to_view else 0
-                                
-                                if max_view_num > 0:
-                                    persons = []
-                                    person_id = 0
-                                    
-                                    # Create a person for each detection
-                                    for camera_id, detections in frame_detections_dict.items():
-                                        view_num = camera_to_view.get(camera_id)
-                                        if view_num is None:
-                                            continue
-                                        
-                                        for detection in detections:
-                                            person = {
-                                                "personID": person_id,
-                                                "ground_points": [-1, -1],
-                                                "views": []
-                                            }
-                                            
-                                            # Initialize all views with -1
-                                            for v in range(1, max_view_num + 1):
-                                                person["views"].append({
-                                                    "viewNum": v,
-                                                    "xmin": -1,
-                                                    "ymin": -1,
-                                                    "xmax": -1,
-                                                    "ymax": -1
-                                                })
-                                            
-                                            # Update the view for this camera
-                                            person["views"][view_num - 1] = {
-                                                "viewNum": view_num,
-                                                "xmin": detection["xmin"],
-                                                "ymin": detection["ymin"],
-                                                "xmax": detection["xmax"],
-                                                "ymax": detection["ymax"]
-                                            }
-                                            
-                                            persons.append(person)
-                                            person_id += 1
-                                    
-                                    # Save to annotation file
-                                    # Use actual_frame_idx (absolute index) for file naming
-                                    frame_id = f"{actual_frame_idx:05d}"
-                                    annot_file = os.path.join(annotations_folder, f"{frame_id}.json")
-                                    # Convert numpy types to Python native types for JSON serialization
-                                    def convert_to_native(obj):
-                                        """Recursively convert numpy types to Python native types"""
-                                        if isinstance(obj, np.integer):
-                                            return int(obj)
-                                        elif isinstance(obj, np.floating):
-                                            return float(obj)
-                                        elif isinstance(obj, np.ndarray):
-                                            return obj.tolist()
-                                        elif isinstance(obj, dict):
-                                            return {key: convert_to_native(value) for key, value in obj.items()}
-                                        elif isinstance(obj, list):
-                                            return [convert_to_native(item) for item in obj]
-                                        return obj
-                                    
-                                    persons_serializable = convert_to_native(persons)
-                                    with open(annot_file, 'w') as f:
-                                        json.dump(persons_serializable, f, indent=4)
-                                    
-                                    if len(persons) > 0:
-                                        detections_created += 1
+                        # Run YOLO detection và lấy trực tiếp kết quả (giống test_preprocess_label.py)
+                        # Dùng trực tiếp kết quả để tránh lỗi khi convert từ JSON
+                        logger.info("Running YOLO detection and getting detections directly...")
+                        multi_camera_detections, frame_images = run_yolo_detection_return_dict(
+                            model_path=model_path,
+                            image_subsets_folder=image_subsets_folder,
+                            camera_folders=camera_folders,
+                            frame_count=frame_count,
+                            start_frame=start_frame,
+                            conf_threshold=conf_threshold,
+                            progress_callback=update_progress
+                        )
                         
-                        logger.info(f"Created detections for {detections_created} frames using YOLO")
+                        # Tính total_detections từ multi_camera_detections
+                        total_detections = 0
+                        for cam_name in camera_names:
+                            for frame_bboxes in multi_camera_detections.get(cam_name, []):
+                                total_detections += len(frame_bboxes)
                         
-                        # Reload annotations after YOLO detection
+                        logger.info(f"Found {total_detections} detections from YOLO (direct result)")
+                        
+                        # Lưu annotations vào JSON để giữ tương thích
+                        logger.info("Saving YOLO detections to annotation files...")
+                        detections_created = run_yolo_detection(
+                            model_path=model_path,
+                            image_subsets_folder=image_subsets_folder,
+                            annotations_folder=annotations_folder,
+                            camera_folders=camera_folders,
+                            frame_count=frame_count,
+                            start_frame=start_frame,
+                            conf_threshold=conf_threshold,
+                            progress_callback=lambda v: None  # Không cần update progress nữa
+                        )
+                        logger.info(f"Saved detections to {detections_created} annotation files")
+                        
+                        # Đọc lại annotations từ JSON để lấy annotation structure (person_idx, view_idx)
+                        # Nhưng vẫn dùng multi_camera_detections trực tiếp cho preprocessing
                         all_annotation_files = sorted(glob.glob(os.path.join(annotations_folder, "*.json")))
-                        
-                        # Apply frame range again (start_frame and end_frame were saved from before)
-                        # Clamp values to valid range based on new total
-                        new_total_frames = len(all_annotation_files)
-                        start_frame_clamped = max(0, min(start_frame, new_total_frames - 1))
-                        end_frame_clamped = max(start_frame_clamped + 1, min(end_frame, new_total_frames))
-                        
-                        # Apply frame range: [start_frame, end_frame)
+                        start_frame_clamped = max(0, min(start_frame, len(all_annotation_files) - 1))
+                        end_frame_clamped = max(start_frame_clamped + 1, min(start_frame + frame_count, len(all_annotation_files)))
                         annotation_files = all_annotation_files[start_frame_clamped:end_frame_clamped]
-                        frame_count = len(annotation_files)
                         
                         all_annotations = []
                         for annot_file in annotation_files:
@@ -3078,15 +2983,13 @@ class MainWindow(QtWidgets.QMainWindow):
                             except:
                                 all_annotations.append([])
                         
-                        # Reconvert to detections and rebuild annotation_to_local_id_map (same as initial conversion)
-                        # Note: frame_idx here is relative to the sliced range (0 to frame_count-1)
-                        multi_camera_detections = {cam: [] for cam in camera_names}
+                        # Tạo annotation_to_local_id_map từ JSON structure
+                        # Map từ (frame_idx, cam_name, person_idx, view_idx) -> local_id
                         annotation_to_local_id_map = {}
-                        total_detections = 0
-                        
                         for frame_idx in range(frame_count):
+                            if frame_idx >= len(all_annotations):
+                                continue
                             frame_data = all_annotations[frame_idx]
-                            frame_bboxes = {cam: [] for cam in camera_names}
                             local_id_counters = {cam: 0 for cam in camera_names}
                             
                             if isinstance(frame_data, list) and len(frame_data) > 0:
@@ -3102,24 +3005,12 @@ class MainWindow(QtWidgets.QMainWindow):
                                         view_num = view.get("viewNum")
                                         cam_name = VIEW_TO_CAMERA.get(view_num)
                                         
-                                        if cam_name and cam_name in frame_bboxes:
-                                            try:
-                                                xmin = int(view["xmin"])
-                                                ymin = int(view["ymin"])
-                                                xmax = int(view["xmax"])
-                                                ymax = int(view["ymax"])
-                                                if xmin >= 0 and ymin >= 0 and xmax > xmin and ymax > ymin:
-                                                    frame_bboxes[cam_name].append([xmin, ymin, xmax, ymax])
-                                                    
-                                                    local_id = local_id_counters[cam_name]
-                                                    annotation_to_local_id_map[(frame_idx, cam_name, person_idx, view_idx)] = local_id
-                                                    local_id_counters[cam_name] += 1
-                                                    total_detections += 1
-                                            except (ValueError, KeyError, TypeError):
-                                                continue
-                            
-                            for cam_name in camera_names:
-                                multi_camera_detections[cam_name].append(frame_bboxes.get(cam_name, []))
+                                        if cam_name and cam_name in camera_names:
+                                            # Map annotation -> local_id dựa trên thứ tự trong multi_camera_detections
+                                            # local_id = thứ tự của bbox trong frame_bboxes của camera đó
+                                            local_id = local_id_counters[cam_name]
+                                            annotation_to_local_id_map[(frame_idx, cam_name, person_idx, view_idx)] = local_id
+                                            local_id_counters[cam_name] += 1
                         
                         if total_detections == 0:
                             QMessageBox.warning(
@@ -3169,14 +3060,47 @@ class MainWindow(QtWidgets.QMainWindow):
             # Get n_clusters from settings (None for auto-detect, or integer for fixed number)
             n_clusters = settings.get("n_clusters", None)
             
+            # Get scale factors from UI (use current values from spinboxes)
+            intrinsic_scale = self._intrinsic_scale_factor
+            translation_scale = self._translation_scale_factor
+            bev_x = self._bev_x
+            bev_y = self._bev_y
+            bev_bounds = self._bev_bounds.copy()
+            
             preprocessor = PreprocessLabel(
                 calib_folder=temp_calib_folder,
                 max_distance_multiview=2.0,
                 max_distance_tracking=50.0,  # Default value
                 n_clusters=n_clusters,  # From dialog settings (None for auto-detect, or integer)
                 max_centroid_movement=5.0,  # Default value
-                smoothing_factor=0.3  # Default value
+                smoothing_factor=0.3,  # Default value
+                intrinsic_scale=intrinsic_scale,  # Use scale factors from UI
+                translation_scale=translation_scale,  # Use scale factors from UI
+                bev_x=bev_x,  # Use BEV dimensions from UI
+                bev_y=bev_y,  # Use BEV dimensions from UI
+                bev_bounds=bev_bounds  # Use BEV bounds from UI
             )
+            
+            # Set image sizes for accurate projection (load from actual images)
+            # This ensures BBoxToBEVConverter uses correct image dimensions instead of estimating
+            import cv2
+            for cam_name in camera_names:
+                # Try to find an image for this camera to get actual size
+                for cam_folder in camera_folders:
+                    cam_path = os.path.join(image_subsets_folder, cam_folder)
+                    if os.path.isdir(cam_path):
+                        image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
+                                           glob.glob(os.path.join(cam_path, "*.png")) + 
+                                           glob.glob(os.path.join(cam_path, "*.jpeg")))
+                        if image_files:
+                            # Load first image to get size
+                            test_image = cv2.imread(image_files[0])
+                            if test_image is not None:
+                                h, w = test_image.shape[:2]
+                                # Set image size in BEV converter
+                                preprocessor.multiview_matcher.bev_converter.set_image_size(cam_name, w, h)
+                                logger.info(f"Set image size for {cam_name}: {w}x{h}")
+                                break
             
             # Preprocessing: 70-85 (or 50-85 if no YOLO)
             current_progress = progress.value()

@@ -9,7 +9,9 @@ class MultiCameraTracking:
     """Multi-camera object mapping (multiview matching only, no temporal tracking)"""
     
     def __init__(self, calib_folder: str, model_name: str = None, model_path: str = None, 
-                 data_path: str = None, max_distance: float = 2.0, n_clusters: int = None):
+                 data_path: str = None, max_distance: float = 2.0, n_clusters: int = None,
+                 intrinsic_scale: float = 0.25, translation_scale: float = 100.0,
+                 bev_x: int = None, bev_y: int = None, bev_bounds: list = None):
         """
         Args:
             calib_folder: Path to calibration folder containing intrinsic/extrinsic
@@ -18,7 +20,15 @@ class MultiCameraTracking:
             data_path: Path to data (optional)
             max_distance: Maximum distance in BEV space for clustering objects (meters) - deprecated, not used with KMeans
             n_clusters: Number of clusters for KMeans. If None, will be auto-determined from number of detections
+            intrinsic_scale: Scale factor for intrinsic matrix (default 0.25 = 1/4)
+            translation_scale: Scale factor for translation vector (default 100.0)
+            bev_x: BEV grid X dimension (default from constants)
+            bev_y: BEV grid Y dimension (default from constants)
+            bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX] (default from constants)
         """
+        from labelme.utils.constants import DEFAULT_INTRINSIC_SCALE, DEFAULT_TRANSLATION_SCALE
+        from labelme.utils.constants import DEFAULT_BEV_X, DEFAULT_BEV_Y, DEFAULT_BEV_BOUNDS
+        
         self.calib_folder = calib_folder
         self.model_name = model_name
         self.model_path = model_path
@@ -27,8 +37,22 @@ class MultiCameraTracking:
         self.n_clusters = n_clusters
         self.model = None
         
-        # Initialize BEV converter
-        self.bev_converter = BBoxToBEVConverter(calib_folder)
+        # Use provided scale factors or defaults from constants
+        intrinsic_scale = intrinsic_scale if intrinsic_scale is not None else DEFAULT_INTRINSIC_SCALE
+        translation_scale = translation_scale if translation_scale is not None else DEFAULT_TRANSLATION_SCALE
+        bev_x = bev_x if bev_x is not None else DEFAULT_BEV_X
+        bev_y = bev_y if bev_y is not None else DEFAULT_BEV_Y
+        bev_bounds = bev_bounds if bev_bounds is not None else DEFAULT_BEV_BOUNDS.copy()
+        
+        # Initialize BEV converter with scale factors
+        self.bev_converter = BBoxToBEVConverter(
+            calib_folder,
+            intrinsic_scale=intrinsic_scale,
+            translation_scale=translation_scale,
+            bev_x=bev_x,
+            bev_y=bev_y,
+            bev_bounds=bev_bounds
+        )
         
         # Mapping results (for single frame)
         self.global_id_map = {}  # {(camera_name, local_id): global_id}

@@ -117,7 +117,9 @@ class PreprocessLabel:
     
     def __init__(self, calib_folder: str, max_distance_multiview: float = 2.0, 
                  max_distance_tracking: float = 50.0, n_clusters: int = None,
-                 max_centroid_movement: float = 5.0, smoothing_factor: float = 0.3):
+                 max_centroid_movement: float = 5.0, smoothing_factor: float = 0.3,
+                 intrinsic_scale: float = 0.25, translation_scale: float = 100.0,
+                 bev_x: int = None, bev_y: int = None, bev_bounds: list = None):
         """
         Args:
             calib_folder: Path to calibration folder containing intrinsic/extrinsic
@@ -130,7 +132,15 @@ class PreprocessLabel:
             max_centroid_movement: Maximum allowed movement of cluster centers between frames (meters) for stability
             smoothing_factor: Smoothing factor for cluster centers (0.0 = no smoothing, 1.0 = full smoothing)
                              Lower values mean more responsive to changes, higher values mean more stable
+            intrinsic_scale: Scale factor for intrinsic matrix (default 0.25 = 1/4)
+            translation_scale: Scale factor for translation vector (default 100.0)
+            bev_x: BEV grid X dimension (default from constants)
+            bev_y: BEV grid Y dimension (default from constants)
+            bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX] (default from constants)
         """
+        from labelme.utils.constants import DEFAULT_INTRINSIC_SCALE, DEFAULT_TRANSLATION_SCALE
+        from labelme.utils.constants import DEFAULT_BEV_X, DEFAULT_BEV_Y, DEFAULT_BEV_BOUNDS
+        
         self.calib_folder = calib_folder
         self.max_distance_multiview = max_distance_multiview
         self.max_distance_tracking = max_distance_tracking
@@ -138,11 +148,23 @@ class PreprocessLabel:
         self.max_centroid_movement = max_centroid_movement
         self.smoothing_factor = smoothing_factor
         
-        # Initialize multiview matcher
+        # Use provided scale factors or defaults from constants
+        self.intrinsic_scale = intrinsic_scale if intrinsic_scale is not None else DEFAULT_INTRINSIC_SCALE
+        self.translation_scale = translation_scale if translation_scale is not None else DEFAULT_TRANSLATION_SCALE
+        self.bev_x = bev_x if bev_x is not None else DEFAULT_BEV_X
+        self.bev_y = bev_y if bev_y is not None else DEFAULT_BEV_Y
+        self.bev_bounds = bev_bounds if bev_bounds is not None else DEFAULT_BEV_BOUNDS.copy()
+        
+        # Initialize multiview matcher with scale factors
         self.multiview_matcher = MultiCameraTracking(
             calib_folder=calib_folder,
             max_distance=max_distance_multiview,
-            n_clusters=n_clusters
+            n_clusters=n_clusters,
+            intrinsic_scale=self.intrinsic_scale,
+            translation_scale=self.translation_scale,
+            bev_x=self.bev_x,
+            bev_y=self.bev_y,
+            bev_bounds=self.bev_bounds
         )
         
         # Final mapping: (frame_idx, camera_name, local_id) -> final_global_id

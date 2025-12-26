@@ -171,6 +171,10 @@ class BBoxToBEVConverter:
         # Cache image sizes to ensure consistency between frames
         self.image_size_cache = {}  # {camera_name: (width, height)}
     
+    def set_image_size(self, camera_name: str, width: int, height: int):
+        """Set image size for a camera (overrides estimation from camera_matrix)"""
+        self.image_size_cache[camera_name] = (int(width), int(height))
+    
     def _get_calibration(self, camera_name):
         """Get calibration info for a camera"""
         if camera_name not in self.calib_cache:
