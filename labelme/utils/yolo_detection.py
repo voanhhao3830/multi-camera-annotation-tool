@@ -209,8 +209,8 @@ def run_yolo_detection_return_dict(
     progress_callback: Optional[Callable[[int], None]] = None
 ) -> Tuple[Dict[str, List[List[List[float]]]], List[Dict[str, np.ndarray]]]:
     """
-    Run YOLO detection với 1 model cho tất cả cameras và trả về detections dict.
-    Sử dụng chính xác logic từ run_yolo_detection nhưng trả về detections thay vì lưu file.
+    Run YOLO detection with 1 model for all cameras and return detections dict.
+    Uses the exact same logic from run_yolo_detection but returns detections instead of saving files.
     
     Args:
         model_path: Path to YOLO model file
@@ -250,7 +250,7 @@ def run_yolo_detection_return_dict(
     }
     frame_images: List[Dict[str, np.ndarray]] = [dict() for _ in range(frame_count)]
     
-    # Process each frame - sử dụng CHÍNH XÁC logic từ run_yolo_detection
+    # Process each frame - using EXACT same logic from run_yolo_detection
     for frame_idx in range(frame_count):
         actual_frame_idx = start_frame + frame_idx
         
@@ -259,7 +259,7 @@ def run_yolo_detection_return_dict(
             progress_value = int(100 * frame_idx / frame_count)
             progress_callback(progress_value)
         
-        # Load images from all cameras for this frame - CHÍNH XÁC như run_yolo_detection
+        # Load images from all cameras for this frame - EXACT same as run_yolo_detection
         for cam_folder in camera_folders:
             cam_path = os.path.join(image_subsets_folder, cam_folder)
             if not os.path.isdir(cam_path):
@@ -275,13 +275,13 @@ def run_yolo_detection_return_dict(
                 image_path = image_files[actual_frame_idx]
                 camera_id = f"Camera{cam_folder}"
                 
-                # Load image and run YOLO - CHÍNH XÁC như run_yolo_detection
+                # Load image and run YOLO - EXACT same as run_yolo_detection
                 image = cv2.imread(image_path)
                 if image is not None:
-                    # Run YOLO detection - CHÍNH XÁC như run_yolo_detection
+                    # Run YOLO detection - EXACT same as run_yolo_detection
                     results = yolo_model(image, verbose=False, conf=conf_threshold)
                     
-                    # Extract detections - CHÍNH XÁC như run_yolo_detection
+                    # Extract detections - EXACT same as run_yolo_detection
                     detections = []
                     for result in results:
                         boxes = result.boxes
@@ -296,7 +296,7 @@ def run_yolo_detection_return_dict(
                                 "class": int(box.cls[0].cpu().numpy())
                             })
                     
-                    # Convert detections format từ dict sang list of [x1,y1,x2,y2]
+                    # Convert detections format from dict to list of [x1,y1,x2,y2]
                     bboxes: List[List[float]] = []
                     for det in detections:
                         bboxes.append([float(det["xmin"]), float(det["ymin"]), 
@@ -307,7 +307,7 @@ def run_yolo_detection_return_dict(
                 else:
                     multi_camera_detections[camera_id].append([])
             else:
-                # Nếu không có ảnh cho frame này, thêm empty list
+                # If no image for this frame, add empty list
                 camera_id = f"Camera{cam_folder}"
                 if camera_id not in multi_camera_detections:
                     multi_camera_detections[camera_id] = []

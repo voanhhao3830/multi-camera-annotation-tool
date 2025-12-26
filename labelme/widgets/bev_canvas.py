@@ -74,7 +74,7 @@ class BEVCanvas(QtWidgets.QWidget):
         self.point_radius = 4  # radius in pixels
         
         # Track locked state for each point by group_id
-        # Locked points are "chốt label" - cannot be edited and shown in black color
+        # Locked points are "locked label" - cannot be edited and shown in black color
         self.points_locked: dict[Optional[int], bool] = {}  # group_id -> locked (True/False)
         
         # Dragging state for points

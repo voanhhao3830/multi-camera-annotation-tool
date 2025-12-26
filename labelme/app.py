@@ -1520,7 +1520,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _update_shape_color(self, shape):
-        # Check if shape is locked (chốt label) - locked shapes are black
+        # Check if shape is locked (locked label) - locked shapes are black
         is_locked = getattr(shape, '_bev_locked', False)
         
         if is_locked:
@@ -2932,8 +2932,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         # Get conf_threshold from settings
                         conf_threshold = settings.get("conf_threshold", 0.5)
                         
-                        # Run YOLO detection và lấy trực tiếp kết quả (giống test_preprocess_label.py)
-                        # Dùng trực tiếp kết quả để tránh lỗi khi convert từ JSON
+                        # Run YOLO detection and get results directly (same as test_preprocess_label.py)
+                        # Use results directly to avoid errors when converting from JSON
                         logger.info("Running YOLO detection and getting detections directly...")
                         multi_camera_detections, frame_images = run_yolo_detection_return_dict(
                             model_path=model_path,
@@ -2945,7 +2945,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             progress_callback=update_progress
                         )
                         
-                        # Tính total_detections từ multi_camera_detections
+                        # Calculate total_detections from multi_camera_detections
                         total_detections = 0
                         for cam_name in camera_names:
                             for frame_bboxes in multi_camera_detections.get(cam_name, []):
@@ -2953,7 +2953,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         
                         logger.info(f"Found {total_detections} detections from YOLO (direct result)")
                         
-                        # Lưu annotations vào JSON để giữ tương thích
+                        # Save annotations to JSON to maintain compatibility
                         logger.info("Saving YOLO detections to annotation files...")
                         detections_created = run_yolo_detection(
                             model_path=model_path,
@@ -2963,12 +2963,12 @@ class MainWindow(QtWidgets.QMainWindow):
                             frame_count=frame_count,
                             start_frame=start_frame,
                             conf_threshold=conf_threshold,
-                            progress_callback=lambda v: None  # Không cần update progress nữa
+                            progress_callback=lambda v: None  # No need to update progress anymore
                         )
                         logger.info(f"Saved detections to {detections_created} annotation files")
                         
-                        # Đọc lại annotations từ JSON để lấy annotation structure (person_idx, view_idx)
-                        # Nhưng vẫn dùng multi_camera_detections trực tiếp cho preprocessing
+                        # Read annotations from JSON again to get annotation structure (person_idx, view_idx)
+                        # But still use multi_camera_detections directly for preprocessing
                         all_annotation_files = sorted(glob.glob(os.path.join(annotations_folder, "*.json")))
                         start_frame_clamped = max(0, min(start_frame, len(all_annotation_files) - 1))
                         end_frame_clamped = max(start_frame_clamped + 1, min(start_frame + frame_count, len(all_annotation_files)))
@@ -2983,8 +2983,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             except:
                                 all_annotations.append([])
                         
-                        # Tạo annotation_to_local_id_map từ JSON structure
-                        # Map từ (frame_idx, cam_name, person_idx, view_idx) -> local_id
+                        # Create annotation_to_local_id_map from JSON structure
+                        # Map from (frame_idx, cam_name, person_idx, view_idx) -> local_id
                         annotation_to_local_id_map = {}
                         for frame_idx in range(frame_count):
                             if frame_idx >= len(all_annotations):
@@ -3006,8 +3006,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                         cam_name = VIEW_TO_CAMERA.get(view_num)
                                         
                                         if cam_name and cam_name in camera_names:
-                                            # Map annotation -> local_id dựa trên thứ tự trong multi_camera_detections
-                                            # local_id = thứ tự của bbox trong frame_bboxes của camera đó
+                                            # Map annotation -> local_id based on order in multi_camera_detections
+                                            # local_id = order of bbox in frame_bboxes of that camera
                                             local_id = local_id_counters[cam_name]
                                             annotation_to_local_id_map[(frame_idx, cam_name, person_idx, view_idx)] = local_id
                                             local_id_counters[cam_name] += 1
