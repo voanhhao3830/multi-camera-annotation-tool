@@ -3166,12 +3166,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QApplication.processEvents()
             
             # Run PreprocessLabel
-            # Use default values for tracking parameters
+            # Get n_clusters from settings (None for auto-detect, or integer for fixed number)
+            n_clusters = settings.get("n_clusters", None)
+            
             preprocessor = PreprocessLabel(
                 calib_folder=temp_calib_folder,
                 max_distance_multiview=2.0,
                 max_distance_tracking=50.0,  # Default value
-                n_clusters=10,  # Default value
+                n_clusters=n_clusters,  # From dialog settings (None for auto-detect, or integer)
                 max_centroid_movement=5.0,  # Default value
                 smoothing_factor=0.3  # Default value
             )

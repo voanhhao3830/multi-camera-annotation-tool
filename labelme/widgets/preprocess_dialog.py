@@ -4,7 +4,7 @@ import os
 from PyQt5 import QtCore
 from PyQt5 import QtGui
 from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QDoubleSpinBox, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox, QDoubleSpinBox, QPushButton, QFileDialog, QMessageBox, QGroupBox, QFormLayout, QComboBox
 
 
 class PreprocessDialog(QDialog):
@@ -64,6 +64,20 @@ class PreprocessDialog(QDialog):
         frame_group.setLayout(frame_layout)
         layout.addWidget(frame_group)
         
+        # Object tracking group
+        tracking_group = QGroupBox("Object Tracking Settings")
+        tracking_layout = QFormLayout()
+        
+        self.num_objects_combo = QComboBox()
+        self.num_objects_combo.setEditable(True)
+        self.num_objects_combo.addItem("Auto detect")
+        self.num_objects_combo.setCurrentText("Auto detect")
+        self.num_objects_combo.setToolTip("Enter 'Auto detect' or a number (e.g., 5, 10) to specify the number of objects")
+        tracking_layout.addRow("Number of Objects:", self.num_objects_combo)
+        
+        tracking_group.setLayout(tracking_layout)
+        layout.addWidget(tracking_group)
+        
         # Buttons
         button_layout = QHBoxLayout()
         self.ok_button = QPushButton("Run Preprocessing")
@@ -94,9 +108,23 @@ class PreprocessDialog(QDialog):
     
     def get_settings(self):
         """Get preprocessing settings"""
+        # Parse number of objects: "Auto detect" or empty -> None, otherwise try to parse as integer
+        num_objects_text = self.num_objects_combo.currentText().strip().lower()
+        n_clusters = None
+        
+        if num_objects_text and num_objects_text != "auto detect":
+            try:
+                n_clusters = int(num_objects_text)
+                if n_clusters < 1:
+                    n_clusters = None
+            except ValueError:
+                # If not a valid number, treat as auto-detect
+                n_clusters = None
+        
         return {
             "model_path": self.model_path_edit.text() if self.model_path_edit.text() else None,
             "conf_threshold": self.conf_threshold_spinbox.value(),
             "start_frame": self.start_frame_spinbox.value(),  # Always return value (0 for start)
             "end_frame": self.end_frame_spinbox.value(),  # Always return value (will be clamped to actual frame count)
+            "n_clusters": n_clusters,  # None for auto-detect, or integer for fixed number
         }
