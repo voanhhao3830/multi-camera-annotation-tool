@@ -721,6 +721,10 @@ class BEVCanvas(QtWidgets.QWidget):
             # Update point position
             _, _, label, group_id = self.points[self.dragging_point_idx]
             self.points[self.dragging_point_idx] = (new_x, new_y, label, group_id)
+            
+            # Emit signal during dragging for real-time updates in multiview
+            self.pointMoved.emit(group_id, new_x, new_y)
+            
             self.update()
             return
         
