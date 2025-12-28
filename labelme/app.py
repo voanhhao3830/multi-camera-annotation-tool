@@ -3062,8 +3062,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         from labelme.utils.yolo_detection import run_yolo_detection_return_dict, run_yolo_detection
                         
                         # Progress callback function
-                        def update_progress(value):
-                            progress.setValue(value)
+                        # Map YOLO progress (0-100) to preprocessing progress range (45-70)
+                        def update_progress(yolo_progress):
+                            # yolo_progress is 0-100, map to 45-70
+                            mapped_progress = 45 + int((yolo_progress / 100.0) * 25)  # 45 + (0-25) = 45-70
+                            progress.setValue(mapped_progress)
                             QtWidgets.QApplication.processEvents()
                         
                         # Get conf_threshold from settings
@@ -3187,11 +3190,19 @@ class MainWindow(QtWidgets.QMainWindow):
             
             logger.info(f"Found {total_detections} detections across {frames_with_detections} frames")
             
+            # Set progress before preprocessing
+            # If we ran YOLO, progress should be at 70
             # If we didn't run YOLO, set progress to 50 (detections already existed)
-            # If we ran YOLO, progress is already at 70
-            if total_detections > 0 and progress.value() < 70:
+            current_progress_before_preprocess = progress.value()
+            if current_progress_before_preprocess < 50:
+                # No YOLO was run, detections existed
                 progress.setValue(50)
-                QtWidgets.QApplication.processEvents()
+            elif current_progress_before_preprocess < 70:
+                # YOLO might have been interrupted or didn't complete properly
+                progress.setValue(50)
+            # If already at 70, keep it (YOLO completed)
+            
+            QtWidgets.QApplication.processEvents()
             
             # Run PreprocessLabel
             # Get n_clusters from settings (None for auto-detect, or integer for fixed number)
@@ -3262,13 +3273,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     logger.warning(f"Camera folder path does not exist: {cam_path}")
             
-            # Preprocessing: 70-85 (or 50-85 if no YOLO)
-            current_progress = progress.value()
-            progress.setValue(current_progress + 5)
+            # Preprocessing: progress from current (50 or 70) to 85
+            # Set progress to indicate preprocessing is starting
+            current_preprocess_start = progress.value()
+            if current_preprocess_start == 50:
+                # No YOLO, preprocessing from 50 to 85 (35 points)
+                progress.setValue(55)  # Small increment to show preprocessing started
+            elif current_preprocess_start == 70:
+                # YOLO was run, preprocessing from 70 to 85 (15 points)
+                progress.setValue(72)  # Small increment to show preprocessing started
+            else:
+                # Unexpected value, set to reasonable starting point
+                progress.setValue(55)
             QtWidgets.QApplication.processEvents()
             
+            # Run preprocessing (this may take a while)
             global_id_map = preprocessor.preprocess(multi_camera_detections)
             
+            # Preprocessing completed, set to 85
             progress.setValue(85)
             QtWidgets.QApplication.processEvents()
             
@@ -3377,7 +3399,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             frame_data[person_idx]["ground_points"] = [float(grid_x), float(grid_y)]
                             updated_pairs.add(pair_key)
             
-            # Save updated annotations
+            # Save updated annotations: progress from 85 to 100 (15 points)
+            progress.setValue(85)
+            QtWidgets.QApplication.processEvents()
+            
+            total_annotations = len(all_annotations)
             for frame_idx, annot_data in enumerate(all_annotations):
                 if frame_idx < len(annotation_files):
                     annot_file = annotation_files[frame_idx]
@@ -3399,6 +3425,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     annot_data_serializable = convert_to_native(annot_data)
                     with open(annot_file, 'w') as f:
                         json.dump(annot_data_serializable, f, indent=4)
+                
+                # Update progress: 85 + (frame_idx / total_annotations) * 15
+                if total_annotations > 0:
+                    save_progress = 85 + int((frame_idx + 1) / total_annotations * 15)
+                    progress.setValue(min(save_progress, 100))
+                    if (frame_idx + 1) % 10 == 0:  # Update every 10 frames to avoid too frequent updates
+                        QtWidgets.QApplication.processEvents()
             
             progress.setValue(100)
             QtWidgets.QApplication.processEvents()
