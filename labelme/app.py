@@ -2355,8 +2355,25 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # Try to project bbox to BEV
                                 try:
                                     from labelme.utils.project_bev import convert_bbox_to_bev
-                                    # VIEW_TO_CAMERA mapping: viewNum (1-indexed) -> camera name
-                                    VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+                                    # VIEW_TO_CAMERA mapping: viewNum (folder number) -> camera name
+                                    # Build mapping from calibrations folder
+                                    VIEW_TO_CAMERA = {}
+                                    if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                                        calibrations_dir = os.path.join(self._aicv_root_dir, "calibrations")
+                                        if os.path.exists(calibrations_dir):
+                                            camera_mapping = _get_aicv_camera_mapping(calibrations_dir)
+                                            # camera_mapping: folder_num -> camera_name
+                                            for folder_num, cam_name in camera_mapping.items():
+                                                try:
+                                                    view_num = int(folder_num)
+                                                    VIEW_TO_CAMERA[view_num] = cam_name
+                                                except (ValueError, TypeError):
+                                                    continue
+                                    
+                                    # Fallback: if no mapping found, try default Camera{viewNum}
+                                    if not VIEW_TO_CAMERA and view_num:
+                                        VIEW_TO_CAMERA[view_num] = f"Camera{view_num}"
+                                    
                                     camera_name = VIEW_TO_CAMERA.get(view_num)
                                     if camera_name:
                                         bbox = [xmin, ymin, xmax, ymax]
@@ -2409,8 +2426,25 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                     
                     # Map viewNum to camera_id, then find correct index in multi_camera_data
-                    # viewNum is 1-indexed: viewNum=3 -> Camera3
-                    VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+                    # viewNum corresponds to folder number in Image_subsets
+                    # Build VIEW_TO_CAMERA mapping from calibrations folder
+                    VIEW_TO_CAMERA = {}
+                    if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                        calibrations_dir = os.path.join(self._aicv_root_dir, "calibrations")
+                        if os.path.exists(calibrations_dir):
+                            camera_mapping = _get_aicv_camera_mapping(calibrations_dir)
+                            # camera_mapping: folder_num -> camera_name
+                            for folder_num, cam_name in camera_mapping.items():
+                                try:
+                                    view_num_int = int(folder_num)
+                                    VIEW_TO_CAMERA[view_num_int] = cam_name
+                                except (ValueError, TypeError):
+                                    continue
+                    
+                    # Fallback: if no mapping found, try default Camera{viewNum}
+                    if not VIEW_TO_CAMERA and view_num:
+                        VIEW_TO_CAMERA[view_num] = f"Camera{view_num}"
+                    
                     camera_id_from_view = VIEW_TO_CAMERA.get(view_num)
                     
                     if not camera_id_from_view:
@@ -2725,14 +2759,58 @@ class MainWindow(QtWidgets.QMainWindow):
             progress.setValue(10)
             QtWidgets.QApplication.processEvents()
             
-            # Get camera folders
+            # Get camera folders from Image_subsets (load dynamically, no hardcode)
             camera_folders = sorted([d for d in os.listdir(image_subsets_folder)
                                    if os.path.isdir(os.path.join(image_subsets_folder, d))])
-            camera_names = [f"Camera{i}" for i in range(1, 7) if str(i) in camera_folders]
             
-            if not camera_names:
-                QMessageBox.warning(self, "Preprocessing", "No camera folders found.")
+            if not camera_folders:
+                QMessageBox.warning(self, "Preprocessing", "No camera folders found in Image_subsets.")
                 return
+            
+            # Create mapping from folder number to calibration camera name
+            # Calibration folder can be: "Camera{number}" or "{number}" directly
+            folder_to_calib_name = {}  # folder_num -> calibration_camera_name
+            
+            if os.path.exists(calibrations_root):
+                # Get all calibration folders
+                calib_dirs = [d for d in os.listdir(calibrations_root) 
+                             if os.path.isdir(os.path.join(calibrations_root, d))]
+                
+                # Build mapping: try to match folder number with calibration folder
+                import re
+                for calib_dir in calib_dirs:
+                    # Extract number from calibration folder name
+                    # Could be "Camera11" -> "11" or "11" -> "11"
+                    match = re.search(r'(\d+)', calib_dir)
+                    if match:
+                        folder_num = match.group(1)
+                        # Store the actual calibration folder name (could be Camera11 or 11)
+                        folder_to_calib_name[folder_num] = calib_dir
+            
+            # Create camera_names: use calibration folder name if found, otherwise use Camera{folder_num}
+            camera_names = []
+            folder_to_camera_name = {}  # folder_num -> camera_name (for use in processing)
+            
+            for folder_num in camera_folders:
+                # Try to find calibration folder name
+                calib_name = folder_to_calib_name.get(folder_num)
+                
+                if calib_name:
+                    # Use calibration folder name as camera name
+                    camera_name = calib_name
+                else:
+                    # Default: create Camera{folder_num}
+                    camera_name = f"Camera{folder_num}"
+                
+                camera_names.append(camera_name)
+                folder_to_camera_name[folder_num] = camera_name
+            
+            # Sort camera names to ensure consistent order
+            camera_names = sorted(camera_names)
+            
+            logger.info(f"Found {len(camera_names)} cameras from {len(camera_folders)} folders:")
+            logger.info(f"  Folders: {camera_folders}")
+            logger.info(f"  Camera names: {camera_names}")
             
             # Load calibrations to temp folder
             progress.setValue(20)
@@ -2744,9 +2822,28 @@ class MainWindow(QtWidgets.QMainWindow):
             os.makedirs(intrinsic_folder, exist_ok=True)
             os.makedirs(extrinsic_folder, exist_ok=True)
             
-            for cam_name in camera_names:
-                cam_root = os.path.join(calibrations_root, cam_name, "calibrations")
-                if not os.path.exists(cam_root):
+            # Copy calibration files for all cameras
+            # Try both "Camera{number}" and "{number}" formats
+            cameras_with_calib = []
+            for folder_num, cam_name in folder_to_camera_name.items():
+                # Try to find calibration folder - could be cam_name or folder_num
+                calib_folder_candidates = [
+                    cam_name,  # e.g., "Camera11"
+                    folder_num,  # e.g., "11"
+                ]
+                
+                cam_root = None
+                used_calib_name = None
+                
+                for calib_candidate in calib_folder_candidates:
+                    test_path = os.path.join(calibrations_root, calib_candidate, "calibrations")
+                    if os.path.exists(test_path):
+                        cam_root = test_path
+                        used_calib_name = calib_candidate
+                        break
+                
+                if not cam_root:
+                    logger.warning(f"Calibration folder not found for {cam_name} (folder {folder_num}). Tried: {calib_folder_candidates}")
                     continue
                 
                 # Find intrinsic subfolder
@@ -2760,24 +2857,53 @@ class MainWindow(QtWidgets.QMainWindow):
                 extrinsic_subfolder = os.path.join(cam_root, "extrinsic")
                 
                 if not intrinsic_subfolder or not os.path.exists(extrinsic_subfolder):
+                    logger.warning(f"Intrinsic or extrinsic folder not found for {cam_name}")
                     continue
                 
+                # Try to find calibration files - could be intr_{cam_name}.xml or intr_{used_calib_name}.xml
                 intrinsic_files = glob.glob(os.path.join(intrinsic_subfolder, f"intr_{cam_name}.xml"))
                 extrinsic_files = glob.glob(os.path.join(extrinsic_subfolder, f"extr_{cam_name}.xml"))
                 
+                # If not found with cam_name, try with used_calib_name
+                if not intrinsic_files or not extrinsic_files:
+                    intrinsic_files = glob.glob(os.path.join(intrinsic_subfolder, f"intr_{used_calib_name}.xml"))
+                    extrinsic_files = glob.glob(os.path.join(extrinsic_subfolder, f"extr_{used_calib_name}.xml"))
+                
+                # If still not found, try to find any intrinsic/extrinsic files in the folder
                 if not intrinsic_files or not extrinsic_files:
                     all_intrinsic = glob.glob(os.path.join(intrinsic_subfolder, "*.xml"))
                     all_extrinsic = glob.glob(os.path.join(extrinsic_subfolder, "*.xml"))
                     if all_intrinsic and all_extrinsic:
                         intrinsic_files = [all_intrinsic[0]]
                         extrinsic_files = [all_extrinsic[0]]
+                        logger.info(f"Using first available calibration files for {cam_name} (from {used_calib_name})")
                     else:
+                        logger.warning(f"No calibration files found for {cam_name} (tried {used_calib_name})")
                         continue
                 
+                # Copy to temp folder with camera_name (for consistency in processing)
                 dest_intr = os.path.join(intrinsic_folder, f"intr_{cam_name}.xml")
                 dest_extr = os.path.join(extrinsic_folder, f"extr_{cam_name}.xml")
-                shutil.copy2(intrinsic_files[0], dest_intr)
-                shutil.copy2(extrinsic_files[0], dest_extr)
+                try:
+                    shutil.copy2(intrinsic_files[0], dest_intr)
+                    shutil.copy2(extrinsic_files[0], dest_extr)
+                    cameras_with_calib.append(cam_name)
+                    logger.info(f"Copied calibration files for {cam_name}")
+                except Exception as e:
+                    logger.error(f"Failed to copy calibration files for {cam_name}: {e}")
+            
+            if not cameras_with_calib:
+                QMessageBox.warning(
+                    self,
+                    "Preprocessing",
+                    f"No calibration files found for any cameras.\n\n"
+                    f"Expected cameras: {camera_names}\n\n"
+                    f"Please ensure calibration files exist in:\n{calibrations_root}"
+                )
+                shutil.rmtree(temp_calib_folder, ignore_errors=True)
+                return
+            
+            logger.info(f"Successfully loaded calibrations for {len(cameras_with_calib)} cameras: {cameras_with_calib}")
             
             progress.setValue(30)
             QtWidgets.QApplication.processEvents()
@@ -2859,7 +2985,18 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
             
             # Convert annotations to detection format (same logic as test_process_label.py)
-            VIEW_TO_CAMERA = {i: f"Camera{i}" for i in range(1, 7)}
+            # Create VIEW_TO_CAMERA mapping: viewNum (folder number) -> camera_name
+            # viewNum in annotations corresponds to folder number in Image_subsets
+            VIEW_TO_CAMERA = {}
+            for folder_num, cam_name in folder_to_camera_name.items():
+                try:
+                    view_num = int(folder_num)
+                    VIEW_TO_CAMERA[view_num] = cam_name
+                except (ValueError, TypeError):
+                    continue
+            
+            logger.info(f"VIEW_TO_CAMERA mapping: {VIEW_TO_CAMERA}")
+            
             multi_camera_detections = {cam: [] for cam in camera_names}
             annotation_to_local_id_map = {}  # Map from annotation to local_id: {(frame_idx, cam_name, person_idx, view_idx): local_id}
             
@@ -3084,23 +3221,46 @@ class MainWindow(QtWidgets.QMainWindow):
             # Set image sizes for accurate projection (load from actual images)
             # This ensures BBoxToBEVConverter uses correct image dimensions instead of estimating
             import cv2
+            import re
             for cam_name in camera_names:
-                # Try to find an image for this camera to get actual size
-                for cam_folder in camera_folders:
-                    cam_path = os.path.join(image_subsets_folder, cam_folder)
-                    if os.path.isdir(cam_path):
-                        image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
-                                           glob.glob(os.path.join(cam_path, "*.png")) + 
-                                           glob.glob(os.path.join(cam_path, "*.jpeg")))
-                        if image_files:
-                            # Load first image to get size
-                            test_image = cv2.imread(image_files[0])
-                            if test_image is not None:
-                                h, w = test_image.shape[:2]
-                                # Set image size in BEV converter
-                                preprocessor.multiview_matcher.bev_converter.set_image_size(cam_name, w, h)
-                                logger.info(f"Set image size for {cam_name}: {w}x{h}")
-                                break
+                # Extract camera number from camera_name (e.g., "Camera1" -> "1")
+                match = re.search(r'(\d+)', cam_name)
+                if not match:
+                    logger.warning(f"Could not extract number from camera name: {cam_name}")
+                    continue
+                
+                cam_number = match.group(1)
+                # Find the corresponding camera folder
+                cam_folder = None
+                for folder in camera_folders:
+                    if folder == cam_number:
+                        cam_folder = folder
+                        break
+                
+                if cam_folder is None:
+                    logger.warning(f"Could not find folder for camera: {cam_name}")
+                    continue
+                
+                # Get image path for this camera
+                cam_path = os.path.join(image_subsets_folder, cam_folder)
+                if os.path.isdir(cam_path):
+                    image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
+                                       glob.glob(os.path.join(cam_path, "*.png")) + 
+                                       glob.glob(os.path.join(cam_path, "*.jpeg")))
+                    if image_files:
+                        # Load first image to get size
+                        test_image = cv2.imread(image_files[0])
+                        if test_image is not None:
+                            h, w = test_image.shape[:2]
+                            # Set image size in BEV converter
+                            preprocessor.multiview_matcher.bev_converter.set_image_size(cam_name, w, h)
+                            logger.info(f"Set image size for {cam_name} (folder {cam_folder}): {w}x{h}")
+                        else:
+                            logger.warning(f"Could not load image for {cam_name} from {image_files[0]}")
+                    else:
+                        logger.warning(f"No image files found for {cam_name} in folder {cam_path}")
+                else:
+                    logger.warning(f"Camera folder path does not exist: {cam_path}")
             
             # Preprocessing: 70-85 (or 50-85 if no YOLO)
             current_progress = progress.value()

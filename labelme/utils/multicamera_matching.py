@@ -82,15 +82,24 @@ class MultiCameraTracking:
         """
         bev_results = {}
         
+        # Process ALL cameras in detections - ensure none are skipped
         for camera_name, bboxes in detections.items():
             bev_coords_list = []
-            for bbox in bboxes:
+            for local_id, bbox in enumerate(bboxes):
                 result = self.bev_converter.bbox_to_bev(camera_name, bbox, z_world=0.0)
                 if result['success']:
                     bev_coords_list.append(result['bev_coords'])
                 else:
                     bev_coords_list.append(None)
             bev_results[camera_name] = bev_coords_list
+        
+        # Verify all cameras were processed
+        if len(bev_results) != len(detections):
+            missing_cams = set(detections.keys()) - set(bev_results.keys())
+            print(f"WARNING: Some cameras were not processed in project_bev: {missing_cams}")
+            # Add missing cameras with empty results
+            for cam_name in missing_cams:
+                bev_results[cam_name] = []
         
         return bev_results
     

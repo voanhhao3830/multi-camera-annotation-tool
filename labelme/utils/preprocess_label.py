@@ -191,6 +191,15 @@ class PreprocessLabel:
         camera_names = list(multi_camera_detections.keys())
         num_frames = len(multi_camera_detections[camera_names[0]])
         
+        # Verify all cameras have the same number of frames
+        for cam_name in camera_names:
+            cam_frames = len(multi_camera_detections[cam_name])
+            if cam_frames != num_frames:
+                print(f"WARNING: Camera {cam_name} has {cam_frames} frames, expected {num_frames}")
+        
+        print(f"Processing {len(camera_names)} cameras: {camera_names}")
+        print(f"Total frames: {num_frames}")
+        
         # Step 1: Multiview matching for each frame
         # frame_multiview_map: {frame_idx: {(camera_name, local_id): frame_global_id}}
         frame_multiview_maps = {}
@@ -201,13 +210,21 @@ class PreprocessLabel:
         prev_smoothed_centroids = None  # Track smoothed centroids for next frame
         
         for frame_idx in range(num_frames):
-            # Get detections for this frame
+            # Get detections for this frame - ensure ALL cameras are included
             frame_detections = {}
             for camera_name in camera_names:
                 if frame_idx < len(multi_camera_detections[camera_name]):
                     frame_detections[camera_name] = multi_camera_detections[camera_name][frame_idx]
                 else:
                     frame_detections[camera_name] = []
+            
+            # Verify all cameras are in frame_detections
+            if len(frame_detections) != len(camera_names):
+                missing_cams = set(camera_names) - set(frame_detections.keys())
+                print(f"WARNING: Frame {frame_idx} missing cameras: {missing_cams}")
+                # Add missing cameras with empty detections
+                for cam_name in missing_cams:
+                    frame_detections[cam_name] = []
             
             # Match multiview for this frame with warm start from previous frame
             multiview_map = self.multiview_matcher.match_multiview(
@@ -546,7 +563,17 @@ class PreprocessLabel:
         
         if missing_ids_count > 0:
             print(f"WARNING: {missing_ids_count} boxes were assigned fallback IDs (not in temporal tracking)")
+        
+        # Verify all cameras were processed
+        cameras_in_mapping = set()
+        for (frame_idx, camera_name, local_id) in self.final_global_id_map.keys():
+            cameras_in_mapping.add(camera_name)
+        
         print(f"Final mapping completed. Total mappings: {len(self.final_global_id_map)}")
+        print(f"Cameras processed in final mapping: {sorted(cameras_in_mapping)}")
+        if len(cameras_in_mapping) != len(camera_names):
+            missing_cams = set(camera_names) - cameras_in_mapping
+            print(f"WARNING: Some cameras have no mappings: {missing_cams}")
         
         return self.final_global_id_map
     
