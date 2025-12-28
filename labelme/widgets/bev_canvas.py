@@ -215,7 +215,17 @@ class BEVCanvas(QtWidgets.QWidget):
         self.update()
     
     def addPoint(self, x: float, y: float, label: str = "object", group_id: Optional[int] = None):
-        """Add a point marker to the BEV canvas"""
+        """Add a point marker to the BEV canvas. If a point with the same group_id already exists, update it instead of adding a duplicate."""
+        # Check if point with same group_id already exists
+        if group_id is not None:
+            for i, (px, py, plabel, pgid) in enumerate(self.points):
+                if pgid == group_id:
+                    # Update existing point instead of adding duplicate
+                    self.points[i] = (x, y, label, group_id)
+                    self.update()
+                    return
+        
+        # No existing point with this group_id, add new point
         self.points.append((x, y, label, group_id))
         self.update()
     

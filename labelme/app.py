@@ -2270,6 +2270,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
             logger.info(f"Loading {len(annotations)} annotations from {annotation_file}")
             
+            # Track which personIDs have already had points added to BEV to avoid duplicates
+            # Since multiple person entries (one per camera) can have the same personID,
+            # we only want to add one BEV point per personID (the centroid)
+            person_ids_with_bev_points = set()
+            
             for person in annotations:
                 person_id = person.get("personID")
                 # Prioritize 'ground_points' (grid coordinates) over 'coordinates' (world coordinates)
@@ -2282,7 +2287,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
                 
                 # Track if point was added to BEV (point is required for centroid)
-                point_added_to_bev = False
+                # Skip if we already added a point for this personID (avoid duplicates)
+                point_added_to_bev = (person_id in person_ids_with_bev_points)
                 
                 # Add 3D box on BEV if box_3d metadata is available
                 if self.bev_canvas and box_3d:
@@ -2312,11 +2318,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             
                             # IMPORTANT: Also add point (centroid) for this person
                             # Point represents the centroid of the cluster, which is required
-                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                            # Restore locked state if available (don't emit signal during load)
-                            if locked:
-                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
-                            point_added_to_bev = True
+                            # Only add if we haven't added a point for this personID yet
+                            if not point_added_to_bev:
+                                self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                # Restore locked state if available (don't emit signal during load)
+                                if locked:
+                                    self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                person_ids_with_bev_points.add(person_id)
+                                point_added_to_bev = True
                             
                     except Exception as box_e:
                         logger.warning(f"Failed to load 3D box for person {person_id}: {box_e}")
@@ -2335,11 +2344,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             # Transform to memory coordinates for BEV display
                             mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
                             # Add point to BEV canvas (not a box)
-                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                            # Restore locked state if available (don't emit signal during load)
-                            if locked:
-                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
-                            point_added_to_bev = True
+                            # Only add if we haven't added a point for this personID yet
+                            if not point_added_to_bev:
+                                self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                # Restore locked state if available (don't emit signal during load)
+                                if locked:
+                                    self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                person_ids_with_bev_points.add(person_id)
+                                point_added_to_bev = True
                     
                     # If still no point added, try to compute from views or use default position
                     if not point_added_to_bev:
@@ -2392,13 +2404,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                                 )
                                                 if bev_coords:
                                                     mem_x, mem_y = bev_coords
-                                                    self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                                                    # Restore locked state if available (don't emit signal during load)
-                                                    if locked:
-                                                        self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
-                                                    point_added_to_bev = True
-                                                    logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
-                                                    break
+                                                    # Only add if we haven't added a point for this personID yet
+                                                    if not point_added_to_bev:
+                                                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                                        # Restore locked state if available (don't emit signal during load)
+                                                        if locked:
+                                                            self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                                        person_ids_with_bev_points.add(person_id)
+                                                        point_added_to_bev = True
+                                                        logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
+                                                        break
                                 except Exception as e:
                                     logger.debug(f"Failed to compute BEV from view {view_num}: {e}")
                         
@@ -2407,11 +2422,14 @@ class MainWindow(QtWidgets.QMainWindow):
                             # Use center of BEV canvas as default
                             default_x = self._bev_x / 2.0 if hasattr(self, '_bev_x') else 600.0
                             default_y = self._bev_y / 2.0 if hasattr(self, '_bev_y') else 400.0
-                            self.bev_canvas.addPoint(default_x, default_y, "object", person_id)
-                            # Restore locked state if available (don't emit signal during load)
-                            if locked:
-                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
-                            logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
+                            # Only add if we haven't added a point for this personID yet
+                            if person_id not in person_ids_with_bev_points:
+                                self.bev_canvas.addPoint(default_x, default_y, "object", person_id)
+                                # Restore locked state if available (don't emit signal during load)
+                                if locked:
+                                    self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                person_ids_with_bev_points.add(person_id)
+                                logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
                         
                 # Add bounding boxes to camera views
                 for view in views:
