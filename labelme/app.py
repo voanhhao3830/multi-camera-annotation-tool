@@ -5124,9 +5124,34 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.info(f"Point placed at grid({new_x}, {new_y}) with group_id={new_group_id}")
 
     def _on_bev_point_selected(self, group_id: Optional[int]):
-        """Handle point selection - highlight related bounding boxes in camera views"""
+        """Handle point selection - highlight related bounding boxes and project to cameras without objects"""
         if group_id is not None:
             self._highlight_shapes_by_group_id(group_id, highlight=True)
+            
+            # When clicking on a point, project box to cameras that don't have this object yet
+            if self.bev_canvas and self.multi_camera_canvas:
+                # Get point data from BEV canvas
+                point_data = self.bev_canvas.getPointByGroupId(group_id)
+                if point_data:
+                    point_idx, mem_x, mem_y, label, gid = point_data
+                    
+                    # Check if there's a 3D box associated with this point
+                    has_3d_box = False
+                    box_3d_data = None
+                    for box_idx, (center, size, rotation, box_label, box_group_id) in enumerate(self.bev_canvas.boxes_3d):
+                        if box_group_id == group_id:
+                            has_3d_box = True
+                            box_3d_data = (center[0], center[1], center[2], size[0], size[1], size[2], box_label, group_id)
+                            break
+                    
+                    if has_3d_box and box_3d_data:
+                        # Use 3D box projection
+                        x, y, z, w, h, d, box_label, gid = box_3d_data
+                        self._project_3d_box_to_cameras_selective(x, y, z, w, h, d, box_label, group_id)
+                    else:
+                        # Use point projection with default box size
+                        # DEFAULT_BOX_SIZE is already imported at the top of the file
+                        self._project_point_to_cameras_selective(mem_x, mem_y, label, group_id, DEFAULT_BOX_SIZE)
         else:
             # Clear all highlights
             self._clear_all_shape_highlights()
@@ -5580,23 +5605,6 @@ class MainWindow(QtWidgets.QMainWindow):
             img_w = cell.image.width()
             img_h = cell.image.height()
             
-            # Check if box is outside bounds - remove existing shape if it exists
-            if x_min < 0 or y_min < 0 or x_max > img_w or y_max > img_h:
-                logger.debug(f"Box outside image bounds for camera {camera_id}, removing projection")
-                # Remove existing BEV-projected shape if it exists
-                shapes_to_remove = []
-                for shape in cell.shapes:
-                    if (shape.label == label and shape.group_id == group_id and 
-                        shape.other_data.get("from_bev", False)):
-                        shapes_to_remove.append(shape)
-                
-                for shape in shapes_to_remove:
-                    cell.shapes.remove(shape)
-                    self.remLabels([shape])
-                
-                self.multi_camera_canvas.camera_cells[idx] = cell
-                continue
-            
             # If the user manually edited this box on this camera (from_bev == False),
             # stop tracking it from BEV and do not create a new box for this camera.
             skip_camera = False
@@ -5612,6 +5620,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 logger.debug(
                     f"Skip projection for camera {camera_id} because manual-edited box exists"
                 )
+                continue
+            
+            # Check if box is outside bounds - remove existing shape if it exists
+            if x_min < 0 or y_min < 0 or x_max > img_w or y_max > img_h:
+                logger.debug(f"Box outside image bounds for camera {camera_id}, removing projection")
+                # Remove existing BEV-projected shape if it exists
+                shapes_to_remove = []
+                for shape in cell.shapes:
+                    if (shape.label == label and shape.group_id == group_id and 
+                        shape.other_data.get("from_bev", False)):
+                        shapes_to_remove.append(shape)
+                
+                for shape in shapes_to_remove:
+                    cell.shapes.remove(shape)
+                    self.remLabels([shape])
+                
+                self.multi_camera_canvas.camera_cells[idx] = cell
                 continue
 
             # Check if box already exists for this camera (only BEV-projected boxes)
@@ -5655,6 +5680,221 @@ class MainWindow(QtWidgets.QMainWindow):
                 existing_shape.other_data["from_bev"] = True
                 self.multi_camera_canvas.camera_cells[idx] = cell
                 self.multi_camera_canvas.update()
+        
+        self.multi_camera_canvas.update()
+        self.setDirty()
+
+    def _project_3d_box_to_cameras_selective(self, x: float, y: float, z: float, 
+                                             w: float, h: float, d: float,
+                                             label: str, group_id: Optional[int]):
+        """
+        Project 3D box to 2D for cameras that don't have an object with this group_id yet.
+        This is used when clicking on a BEV point to auto-project to empty cameras.
+        """
+        center_3d = np.array([x, y, z])
+        size_3d = np.array([w, h, d])
+        
+        if not self.multi_camera_canvas or not self.multi_camera_data:
+            return
+        
+        # Project to each camera
+        for idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data["camera_id"]
+            calibration = self.camera_calibrations.get(camera_id)
+            
+            if not calibration:
+                logger.warning(f"No calibration for camera {camera_id}, skipping projection")
+                continue
+            
+            cell = self.multi_camera_canvas.camera_cells[idx]
+            
+            # IMPORTANT: Check if this camera already has an object with this group_id
+            # If yes, skip this camera completely - DO NOT project or update anything
+            # This ensures that clicking on a point does not re-project boxes to cameras that already have them
+            if group_id is not None:
+                has_existing_object = False
+                for existing in cell.shapes:
+                    # Check exact match of group_id (handle both int and None cases)
+                    if existing.group_id is not None and existing.group_id == group_id:
+                        has_existing_object = True
+                        logger.info(
+                            f"[SELECTIVE 3D] Skip projection for camera {camera_id} because object with group_id={group_id} already exists (shape label={existing.label})"
+                        )
+                        break
+                
+                if has_existing_object:
+                    # Skip this camera - do not project or update anything
+                    continue
+            
+            # Get 2D corners of the 3D box (8 corners: 4 bottom + 4 top)
+            corners_2d = calibration.project_3d_box_to_2d(center_3d, size_3d, rotation=0.0)
+            
+            if corners_2d is None:
+                logger.debug(f"Box not visible in camera {camera_id}")
+                continue
+            
+            # Filter out NaN values (points behind camera)
+            valid_corners = corners_2d[~np.isnan(corners_2d).any(axis=1)]
+            if len(valid_corners) == 0:
+                logger.debug(f"No valid corners for camera {camera_id}")
+                continue
+            
+            # Get bounding box from valid corners
+            x_min = np.min(valid_corners[:, 0])
+            y_min = np.min(valid_corners[:, 1])
+            x_max = np.max(valid_corners[:, 0])
+            y_max = np.max(valid_corners[:, 1])
+            
+            # Check if bbox is within image bounds
+            img_w = cell.image.width()
+            img_h = cell.image.height()
+            
+            # Check if box is outside bounds - skip this camera
+            if x_min < 0 or y_min < 0 or x_max > img_w or y_max > img_h:
+                logger.debug(f"Box outside image bounds for camera {camera_id}, skipping")
+                continue
+            
+            # Create new rectangle shape from bounding box
+            shape = Shape(
+                label=label,
+                shape_type="rectangle",
+                group_id=group_id,
+            )
+            # Rectangle shape: two points define the rectangle
+            shape.addPoint(QtCore.QPointF(x_min, y_min))
+            shape.addPoint(QtCore.QPointF(x_max, y_max))
+            shape.close()
+            
+            # Mark as BEV-projected box
+            shape.other_data["from_bev"] = True
+            
+            # Add to cell
+            cell.shapes.append(shape)
+            self.multi_camera_canvas.camera_cells[idx] = cell
+            
+            # Add to label list
+            self.addLabel(shape)
+        
+        self.multi_camera_canvas.update()
+        self.setDirty()
+    
+    def _project_point_to_cameras_selective(self, mem_x: float, mem_y: float, 
+                                           label: str, group_id: Optional[int],
+                                           default_box_size: float):
+        """
+        Project point to cameras that don't have an object with this group_id yet.
+        This is used when clicking on a BEV point to auto-project to empty cameras.
+        """
+        if not self.multi_camera_canvas or not self.multi_camera_data:
+            return
+        
+        mem_point = np.array([[mem_x, mem_y]], dtype=np.float32)
+        
+        for cam_idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data.get("camera_id", f"Camera{cam_idx}")
+            calibration = self.camera_calibrations.get(camera_id)
+            
+            if not calibration:
+                continue
+            
+            cell = self.multi_camera_canvas.camera_cells[cam_idx]
+            
+            # IMPORTANT: Check if this camera already has an object with this group_id
+            # If yes, skip this camera completely - DO NOT project or update anything
+            # This ensures that clicking on a point does not re-project boxes to cameras that already have them
+            if group_id is not None:
+                has_existing_object = False
+                for existing in cell.shapes:
+                    # Check exact match of group_id (handle both int and None cases)
+                    if existing.group_id is not None and existing.group_id == group_id:
+                        has_existing_object = True
+                        logger.info(
+                            f"[SELECTIVE POINT] Skip projection for camera {camera_id} because object with group_id={group_id} already exists (shape label={existing.label})"
+                        )
+                        break
+                
+                if has_existing_object:
+                    # Skip this camera - do not project or update anything
+                    continue
+            
+            # Project the point to this camera
+            try:
+                projected = calibration.project_mem_to_2d(
+                    mem_point,
+                    bev_x=self._bev_x,
+                    bev_y=self._bev_y,
+                    bev_bounds=self._bev_bounds,
+                    apply_distortion=True
+                )
+                
+                if np.isnan(projected).any():
+                    continue
+                
+                new_center_x, new_center_y = projected[0]
+                
+                # Check if projection is within image bounds
+                img_w = cell.image.width() if cell.image else 0
+                img_h = cell.image.height() if cell.image else 0
+                
+                if not (0 <= new_center_x < img_w and 0 <= new_center_y < img_h):
+                    continue
+                
+                # Try to get box dimensions from another camera with same group_id
+                width = None
+                height = None
+                for other_cam_idx, other_cam_data in enumerate(self.multi_camera_data):
+                    if other_cam_idx == cam_idx:
+                        continue
+                    other_cell = self.multi_camera_canvas.camera_cells[other_cam_idx]
+                    for other_shape in other_cell.shapes:
+                        if (other_shape.group_id == group_id and 
+                            len(other_shape.points) >= 2):
+                            other_xmin = min(p.x() for p in other_shape.points)
+                            other_xmax = max(p.x() for p in other_shape.points)
+                            other_ymin = min(p.y() for p in other_shape.points)
+                            other_ymax = max(p.y() for p in other_shape.points)
+                            width = other_xmax - other_xmin
+                            height = other_ymax - other_ymin
+                            break
+                    if width is not None:
+                        break
+                
+                # Use default dimensions if not found
+                if width is None or height is None:
+                    # Default box size (can be adjusted)
+                    width = 100.0  # Default width in pixels
+                    height = 200.0  # Default height in pixels
+                
+                # Calculate bounding box centered on projected point
+                new_xmin = new_center_x - width / 2
+                new_xmax = new_center_x + width / 2
+                new_ymax = new_center_y  # Foot at projected point
+                new_ymin = new_center_y - height
+                
+                # Check if new bbox is within bounds
+                if new_xmin >= 0 and new_ymin >= 0 and new_xmax <= img_w and new_ymax <= img_h:
+                    # Create new shape
+                    new_shape = Shape(
+                        label=label,
+                        shape_type="rectangle",
+                        group_id=group_id,
+                    )
+                    new_shape.addPoint(QtCore.QPointF(new_xmin, new_ymin))
+                    new_shape.addPoint(QtCore.QPointF(new_xmax, new_ymax))
+                    new_shape.close()
+                    
+                    # Mark as from BEV
+                    new_shape.other_data["from_bev"] = True
+                    
+                    # Add to cell
+                    cell.shapes.append(new_shape)
+                    self.multi_camera_canvas.camera_cells[cam_idx] = cell
+                    
+                    # Add to label list
+                    self.addLabel(new_shape)
+            except Exception as e:
+                logger.warning(f"Error projecting point to camera {camera_id}: {e}")
+                continue
         
         self.multi_camera_canvas.update()
         self.setDirty()

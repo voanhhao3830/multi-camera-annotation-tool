@@ -80,6 +80,8 @@ class BEVCanvas(QtWidgets.QWidget):
         # Dragging state for points
         self.dragging_point_idx: Optional[int] = None
         self.drag_start_pos: Optional[QPointF] = None
+        # Minimum distance to consider as dragging (in screen pixels)
+        self.drag_threshold = 5.0  # pixels
         
         # Drawing state
         self.drawing_box = False
@@ -725,6 +727,19 @@ class BEVCanvas(QtWidgets.QWidget):
                 self.drag_start_pos = None
                 return
             
+            # Check if mouse has moved enough to be considered dragging
+            if self.drag_start_pos is not None:
+                dx = pos.x() - self.drag_start_pos.x()
+                dy = pos.y() - self.drag_start_pos.y()
+                distance = math.sqrt(dx * dx + dy * dy)
+                
+                # Only emit pointMoved if mouse has moved beyond threshold
+                # This prevents accidental movement when just clicking
+                if distance < self.drag_threshold:
+                    # Not enough movement, don't emit pointMoved signal
+                    # Just update hover state
+                    return
+            
             # Get grid coordinates for new position
             new_x, new_y = self._screen_to_grid(pos)
             
@@ -782,9 +797,19 @@ class BEVCanvas(QtWidgets.QWidget):
         if event.button() == Qt.LeftButton:
             # Finish point dragging
             if self.dragging_point_idx is not None and 0 <= self.dragging_point_idx < len(self.points):
-                # Get final position and emit signal
-                new_x, new_y, label, group_id = self.points[self.dragging_point_idx]
-                self.pointMoved.emit(group_id, new_x, new_y)
+                # Check if mouse actually moved (dragging) or just clicked
+                if self.drag_start_pos is not None:
+                    pos = event.localPos()
+                    dx = pos.x() - self.drag_start_pos.x()
+                    dy = pos.y() - self.drag_start_pos.y()
+                    distance = math.sqrt(dx * dx + dy * dy)
+                    
+                    # Only emit pointMoved if mouse moved beyond threshold
+                    if distance >= self.drag_threshold:
+                        # Get final position and emit signal
+                        new_x, new_y, label, group_id = self.points[self.dragging_point_idx]
+                        self.pointMoved.emit(group_id, new_x, new_y)
+                
                 self.dragging_point_idx = None
                 self.drag_start_pos = None
                 self.update()
