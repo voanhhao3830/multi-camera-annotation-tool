@@ -1029,7 +1029,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._calib_toolbar.addSeparator()
         self._calib_toolbar.addWidget(apply_calib_btn)
         
-        self.addToolBar(Qt.TopToolBarArea, self._calib_toolbar)
+        # Hide the calibration toolbar - settings are now fixed and not user-editable
+        self._calib_toolbar.setVisible(False)
+        # self.addToolBar(Qt.TopToolBarArea, self._calib_toolbar)
 
         self.status_left = QtWidgets.QLabel(self.tr("%s started.") % __appname__)
         self.status_right = StatusStats()
@@ -2445,35 +2447,44 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Map viewNum to camera_id, then find correct index in multi_camera_data
                     # viewNum corresponds to folder number in Image_subsets
-                    # Build VIEW_TO_CAMERA mapping from calibrations folder
-                    VIEW_TO_CAMERA = {}
-                    if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
-                        calibrations_dir = os.path.join(self._aicv_root_dir, "calibrations")
-                        if os.path.exists(calibrations_dir):
-                            camera_mapping = _get_aicv_camera_mapping(calibrations_dir)
-                            # camera_mapping: folder_num -> camera_name
-                            for folder_num, cam_name in camera_mapping.items():
-                                try:
-                                    view_num_int = int(folder_num)
-                                    VIEW_TO_CAMERA[view_num_int] = cam_name
-                                except (ValueError, TypeError):
-                                    continue
+                    # IMPORTANT: camera_id in multi_camera_data is always "Camera{folder_num}" format
+                    # So we need to match viewNum directly to folder_num, not to camera_name
                     
-                    # Fallback: if no mapping found, try default Camera{viewNum}
-                    if not VIEW_TO_CAMERA and view_num:
-                        VIEW_TO_CAMERA[view_num] = f"Camera{view_num}"
-                    
-                    camera_id_from_view = VIEW_TO_CAMERA.get(view_num)
-                    
-                    if not camera_id_from_view:
-                        continue
-                    
+                    # Find camera index in multi_camera_data by matching viewNum to folder number
+                    # The camera_id in multi_camera_data is "Camera{folder_num}" where folder_num is the folder name in Image_subsets
                     # Find camera index in multi_camera_data by matching camera_id
+                    # IMPORTANT: In _scan_aicv_camera_data, camera_id is set to "Camera{folder_num}"
+                    # where folder_num is the folder name in Image_subsets (e.g., "1", "2", etc.)
+                    # viewNum in annotations corresponds to this folder_num
+                    # So we need to match viewNum to camera_id = "Camera{viewNum}"
                     camera_idx = None
+                    
+                    # Build expected camera_id from viewNum
+                    # camera_id format is always "Camera{folder_num}" in _scan_aicv_camera_data
+                    expected_camera_id = f"Camera{view_num}"
+                    
+                    # Find camera by matching camera_id exactly
                     for idx, cam_data in enumerate(self.multi_camera_data):
-                        if cam_data.get("camera_id") == camera_id_from_view:
+                        camera_id = cam_data.get("camera_id", "")
+                        # Match by camera_id which should be "Camera{viewNum}"
+                        if camera_id == expected_camera_id:
                             camera_idx = idx
+                            logger.debug(f"Matched viewNum {view_num} to camera_id {camera_id} at index {idx}")
                             break
+                    
+                    # If not found by exact match, try to match by folder number extracted from camera_id
+                    # This handles cases where camera_id might have different format
+                    if camera_idx is None:
+                        for idx, cam_data in enumerate(self.multi_camera_data):
+                            camera_id = cam_data.get("camera_id", "")
+                            # Extract number from camera_id (e.g., "Camera3" -> 3, "Camera1" -> 1)
+                            match = re.search(r'(\d+)', camera_id)
+                            if match:
+                                folder_num_from_id = int(match.group(1))
+                                if folder_num_from_id == view_num:
+                                    camera_idx = idx
+                                    logger.debug(f"Matched viewNum {view_num} to camera_id {camera_id} (extracted {folder_num_from_id}) at index {idx}")
+                                    break
                     
                     if camera_idx is None or camera_idx < 0 or camera_idx >= len(self.multi_camera_canvas.camera_cells):
                         continue
@@ -2497,12 +2508,19 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._update_shape_color(shape)
                     
                     # Add to the corresponding camera cell
+                    # Double-check that we're adding to the correct camera by verifying camera_id
                     cell = self.multi_camera_canvas.camera_cells[camera_idx]
-                    cell.shapes.append(shape)
-                    self.multi_camera_canvas.camera_cells[camera_idx] = cell
+                    cell_camera_id = self.multi_camera_data[camera_idx].get("camera_id", "")
                     
-                    # Add to label list
-                    self.addLabel(shape)
+                    # Verify camera_id matches expected camera_id for this viewNum
+                    if cell_camera_id == expected_camera_id:
+                        cell.shapes.append(shape)
+                        self.multi_camera_canvas.camera_cells[camera_idx] = cell
+                        # Add to label list
+                        self.addLabel(shape)
+                        logger.debug(f"Added shape for person {person_id} to camera {cell_camera_id} (viewNum {view_num}, idx {camera_idx})")
+                    else:
+                        logger.warning(f"Camera ID mismatch: expected {expected_camera_id}, got {cell_camera_id} at index {camera_idx}. Skipping shape.")
             
             
             # Update BEV canvas
@@ -2559,8 +2577,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # Aggregate shapes by group_id (personID)
         persons = {}  # group_id -> person data
         
+        # Build mapping from camera_id to viewNum (folder number)
+        # This ensures we use the correct folder number, not camera index
+        camera_id_to_view_num = {}
         for camera_idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data.get("camera_id", "")
+            # Extract folder number from camera_id (e.g., "Camera3" -> 3)
+            match = re.search(r'(\d+)', camera_id)
+            if match:
+                folder_num = int(match.group(1))
+                camera_id_to_view_num[camera_id] = folder_num
+            else:
+                # Fallback: use camera_idx + 1 if cannot extract number
+                camera_id_to_view_num[camera_id] = camera_idx + 1
+        
+        # Get all unique viewNums to initialize views properly
+        all_view_nums = sorted(set(camera_id_to_view_num.values()))
+        max_view_num = max(all_view_nums) if all_view_nums else len(self.multi_camera_data)
+        
+        for camera_idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data.get("camera_id", "")
             cell = self.multi_camera_canvas.camera_cells[camera_idx]
+            
+            # Get viewNum for this camera (folder number)
+            view_num = camera_id_to_view_num.get(camera_id, camera_idx + 1)
             
             for shape in cell.shapes:
                 if shape.group_id is None:
@@ -2577,9 +2617,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         "locked": False  # Will be updated from BEV if available
                     }
                     # Initialize all views with -1 (viewNum is 1-indexed to match AICV format)
-                    for view_num in range(1, len(self.multi_camera_data) + 1):
+                    # Use max_view_num to ensure we have enough slots
+                    for vn in range(1, max_view_num + 1):
                         persons[person_id]["views"].append({
-                            "viewNum": view_num,
+                            "viewNum": vn,
                             "xmin": -1,
                             "ymin": -1,
                             "xmax": -1,
@@ -2595,14 +2636,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     xmax = int(max(x_coords))
                     ymax = int(max(y_coords))
                     
-                    # Update the view for this camera (viewNum is 1-indexed)
-                    persons[person_id]["views"][camera_idx] = {
-                        "viewNum": camera_idx + 1,  # 1-indexed
-                        "xmin": xmin,
-                        "ymin": ymin,
-                        "xmax": xmax,
-                        "ymax": ymax
-                    }
+                    # Find the correct view index in the views list (viewNum is 1-indexed, list is 0-indexed)
+                    view_idx = view_num - 1
+                    if 0 <= view_idx < len(persons[person_id]["views"]):
+                        # Update the view for this camera using the correct viewNum (folder number)
+                        persons[person_id]["views"][view_idx] = {
+                            "viewNum": view_num,  # Use folder number, not camera_idx
+                            "xmin": xmin,
+                            "ymin": ymin,
+                            "xmax": xmax,
+                            "ymax": ymax
+                        }
+                    else:
+                        logger.warning(f"View index {view_idx} out of range for person {person_id}, viewNum {view_num}")
         
         # Update ground_points and locked state from BEV points if available
         # BEV points are in memory coordinates, need to convert back to world grid
@@ -4413,6 +4459,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         break
                 item.setCheckState(Qt.Checked if annotation_exists else Qt.Unchecked)
                 self.fileListWidget.addItem(item)
+            
+            # Generate all BEV overlays for all frames (if not already generated)
+            self._generate_all_bev_overlays(root_dir, max_frames)
         elif _detect_multi_camera_structure(root_dir):
             # Legacy multi-camera structure with frames/calibrations per camera
             self.is_multi_camera_mode = True
@@ -4483,6 +4532,142 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     item.setCheckState(Qt.Unchecked)
                 self.fileListWidget.addItem(item)
+
+    def _generate_all_bev_overlays(self, root_dir: str, max_frames: int) -> None:
+        """Generate BEV overlays for all frames if not already generated"""
+        try:
+            bev_overlays_dir = osp.join(root_dir, "bev_overlays")
+            if not osp.exists(bev_overlays_dir):
+                os.makedirs(bev_overlays_dir, exist_ok=True)
+                logger.info(f"Created bev_overlays directory: {bev_overlays_dir}")
+            
+            # Check which frames need to be generated
+            frames_to_generate = []
+            for frame_idx in range(max_frames):
+                overlay_filename = f"{frame_idx:05d}.png"
+                overlay_path = osp.join(bev_overlays_dir, overlay_filename)
+                if not osp.exists(overlay_path):
+                    frames_to_generate.append(frame_idx)
+            
+            if not frames_to_generate:
+                logger.info(f"All {max_frames} BEV overlays already exist, skipping generation")
+                return
+            
+            logger.info(f"Generating BEV overlays for {len(frames_to_generate)} frames (out of {max_frames} total)")
+            
+            # Show progress dialog
+            progress = QtWidgets.QProgressDialog(
+                f"Generating BEV overlays... ({len(frames_to_generate)} frames)",
+                "Cancel",
+                0,
+                len(frames_to_generate),
+                self
+            )
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setValue(0)
+            progress.show()
+            QtWidgets.QApplication.processEvents()
+            
+            # Load calibrations once (they should be the same for all frames)
+            # We'll load calibrations from the first frame
+            first_frame_data = _scan_multi_camera_data(root_dir, 0)
+            if not first_frame_data:
+                logger.warning("Cannot generate BEV overlays: no camera data found")
+                return
+            
+            camera_calibrations = {}
+            for cam_data in first_frame_data:
+                camera_id = cam_data["camera_id"]
+                calibration_path = cam_data.get("calibration_path")
+                
+                if calibration_path and osp.isdir(calibration_path):
+                    intrinsic_original_dir = osp.join(calibration_path, "intrinsic_original")
+                    extrinsic_dir = osp.join(calibration_path, "extrinsic")
+                    
+                    if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir):
+                        intrinsic_files = [f for f in os.listdir(intrinsic_original_dir) if f.endswith('.xml')]
+                        extrinsic_files = [f for f in os.listdir(extrinsic_dir) if f.endswith('.xml')]
+                        
+                        if intrinsic_files and extrinsic_files:
+                            intrinsic_path = osp.join(intrinsic_original_dir, intrinsic_files[0])
+                            extrinsic_path = osp.join(extrinsic_dir, extrinsic_files[0])
+                            
+                            calibration = CameraCalibration.load_from_xml_files_scaled(
+                                intrinsic_path,
+                                extrinsic_path,
+                                intrinsic_scale=self._intrinsic_scale_factor,
+                                translation_scale=self._translation_scale_factor
+                            )
+                            if calibration:
+                                camera_calibrations[camera_id] = calibration
+                        else:
+                            json_path = osp.join(calibration_path, "calibration.json")
+                            if osp.exists(json_path):
+                                calibration = CameraCalibration.load_from_file(json_path)
+                                if calibration:
+                                    camera_calibrations[camera_id] = calibration
+                elif calibration_path and osp.exists(calibration_path):
+                    calibration = CameraCalibration.load_from_file(calibration_path)
+                    if calibration:
+                        camera_calibrations[camera_id] = calibration
+            
+            if not camera_calibrations:
+                logger.warning("Cannot generate BEV overlays: no calibrations found")
+                return
+            
+            # Generate overlays for each frame
+            generated_count = 0
+            for idx, frame_idx in enumerate(frames_to_generate):
+                if progress.wasCanceled():
+                    logger.info("BEV overlay generation cancelled by user")
+                    break
+                
+                # Update progress
+                progress.setValue(idx)
+                progress.setLabelText(f"Generating BEV overlay for frame {frame_idx}... ({idx+1}/{len(frames_to_generate)})")
+                QtWidgets.QApplication.processEvents()
+                
+                # Get camera data for this frame
+                camera_data = _scan_multi_camera_data(root_dir, frame_idx)
+                if not camera_data:
+                    continue
+                
+                # Generate BEV overlay
+                try:
+                    bev_width, bev_height, bev_scale = self._calculate_bev_bounds()
+                    bev_image = generate_bev_from_cameras(
+                        camera_calibrations,
+                        camera_data,
+                        bev_width,
+                        bev_height,
+                        resolution=max(bev_width, bev_height) / 512.0,
+                        bev_x=self._bev_x,
+                        bev_y=self._bev_y,
+                        bev_bounds=self._bev_bounds,
+                    )
+                    
+                    if bev_image is not None:
+                        # Save to file
+                        overlay_filename = f"{frame_idx:05d}.png"
+                        overlay_path = osp.join(bev_overlays_dir, overlay_filename)
+                        
+                        import cv2
+                        bev_image_bgr = cv2.cvtColor(bev_image, cv2.COLOR_RGB2BGR)
+                        cv2.imwrite(overlay_path, bev_image_bgr)
+                        generated_count += 1
+                        
+                        if (idx + 1) % 10 == 0:
+                            logger.info(f"Generated {idx + 1}/{len(frames_to_generate)} BEV overlays...")
+                except Exception as e:
+                    logger.warning(f"Failed to generate BEV overlay for frame {frame_idx}: {e}")
+            
+            progress.setValue(len(frames_to_generate))
+            logger.info(f"Completed generating BEV overlays: {generated_count}/{len(frames_to_generate)} frames")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate BEV overlays: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _load_multi_camera_frame(self, frame_index: int) -> None:
         """Load a multi-camera frame"""
@@ -4566,33 +4751,81 @@ class MainWindow(QtWidgets.QMainWindow):
             # Update camera overlay if BEV already exists
             self.bev_canvas.setCameraOverlay(self.camera_calibrations, camera_data)
             
-            # Regenerate BEV background image when clicking different frame in file list
+            # Load BEV overlay image from local file (fast)
             try:
-                bev_width, bev_height, bev_scale = self._calculate_bev_bounds()
-                logger.info("Regenerating BEV overlay for new frame...")
-                bev_image = generate_bev_from_cameras(
-                    self.camera_calibrations,
-                    camera_data,
-                    bev_width,
-                    bev_height,
-                    resolution=max(bev_width, bev_height) / 512.0,
-                    bev_x=self._bev_x,
-                    bev_y=self._bev_y,
-                    bev_bounds=self._bev_bounds,
-                )
-                if bev_image is not None:
-                    h, w, _ = bev_image.shape
-                    qimg = QtGui.QImage(
-                        bev_image.data,
-                        w,
-                        h,
-                        3 * w,
-                        QtGui.QImage.Format_RGB888,
-                    ).copy()
-                    self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
-                    logger.info("Updated BEV overlay image for new frame")
+                # Determine root directory for bev_overlays folder
+                root_dir = None
+                if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                    root_dir = self._aicv_root_dir
+                elif self._prev_opened_dir:
+                    root_dir = self._prev_opened_dir
+                
+                if root_dir:
+                    bev_overlays_dir = osp.join(root_dir, "bev_overlays")
+                    # Create folder if it doesn't exist
+                    if not osp.exists(bev_overlays_dir):
+                        os.makedirs(bev_overlays_dir, exist_ok=True)
+                        logger.info(f"Created bev_overlays directory: {bev_overlays_dir}")
+                    
+                    # Check if overlay image exists for this frame
+                    overlay_filename = f"{frame_index:05d}.png"
+                    bev_overlay_path = osp.join(bev_overlays_dir, overlay_filename)
+                    
+                    # Load from local file if exists
+                    if osp.exists(bev_overlay_path):
+                        logger.info(f"Loading BEV overlay from local: {bev_overlay_path}")
+                        qimg = QtGui.QImage(bev_overlay_path)
+                        if not qimg.isNull():
+                            self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
+                            logger.info(f"Loaded BEV overlay from local for frame {frame_index}")
+                        else:
+                            logger.warning(f"Failed to load BEV overlay image: {bev_overlay_path}")
+                    else:
+                        # File doesn't exist, generate once and save, then load
+                        logger.info(f"BEV overlay not found, generating for frame {frame_index}...")
+                        bev_width, bev_height, bev_scale = self._calculate_bev_bounds()
+                        bev_image = generate_bev_from_cameras(
+                            self.camera_calibrations,
+                            camera_data,
+                            bev_width,
+                            bev_height,
+                            resolution=max(bev_width, bev_height) / 512.0,
+                            bev_x=self._bev_x,
+                            bev_y=self._bev_y,
+                            bev_bounds=self._bev_bounds,
+                        )
+                        if bev_image is not None:
+                            # Save to local file first
+                            try:
+                                import cv2
+                                # Convert RGB to BGR for OpenCV
+                                bev_image_bgr = cv2.cvtColor(bev_image, cv2.COLOR_RGB2BGR)
+                                cv2.imwrite(bev_overlay_path, bev_image_bgr)
+                                logger.info(f"Saved BEV overlay to local: {bev_overlay_path}")
+                            except Exception as save_e:
+                                logger.warning(f"Failed to save BEV overlay: {save_e}")
+                            
+                            # Load from the saved file
+                            qimg = QtGui.QImage(bev_overlay_path)
+                            if not qimg.isNull():
+                                self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
+                                logger.info(f"Loaded BEV overlay from local for frame {frame_index}")
+                            else:
+                                # Fallback: load directly from memory if file load failed
+                                h, w, _ = bev_image.shape
+                                qimg = QtGui.QImage(
+                                    bev_image.data,
+                                    w,
+                                    h,
+                                    3 * w,
+                                    QtGui.QImage.Format_RGB888,
+                                ).copy()
+                                self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
+                                logger.info("Loaded BEV overlay from memory (fallback)")
+                        else:
+                            logger.warning(f"Failed to generate BEV overlay for frame {frame_index}")
             except Exception as e:
-                logger.warning(f"Failed to update BEV overlay image: {e}")
+                logger.warning(f"Failed to load BEV overlay image: {e}")
         
         # Clear BEV boxes and points when loading new frame
         if self.bev_canvas:
