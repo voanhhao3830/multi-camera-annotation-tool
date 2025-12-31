@@ -913,6 +913,15 @@ class MainWindow(QtWidgets.QMainWindow):
             tip=self.tr("Run preprocessing to assign consistent IDs across frames"),
         )
         
+        # Copy labels from previous frame action
+        copyPrevLabelsAction = action(
+            self.tr("Copy Prev\nLabels"),
+            self._copy_labels_from_previous_frame,
+            None,
+            icon="copy.svg",
+            tip=self.tr("Copy all labels from previous frame with labels"),
+        )
+        
         self.addToolBar(
             Qt.TopToolBarArea,
             ToolBar(
@@ -926,6 +935,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     deleteFile,
                     None,
                     preprocessAction,
+                    copyPrevLabelsAction,
                     None,
                     editMode,
                     duplicate,
@@ -3540,6 +3550,472 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0
         except:
             return 0
+
+    def _find_previous_frame_with_labels(self, current_frame_index: int) -> int | None:
+        """Find the previous frame index that has labels (JSON file exists)"""
+        # Find root directory
+        root_dir = None
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        
+        if not root_dir:
+            logger.warning("No root directory found for finding previous frame with labels")
+            return None
+        
+        logger.info(f"Looking for previous frame with labels, current frame: {current_frame_index}, root_dir: {root_dir}")
+        
+        # Check annotations_positions folder first (global annotations)
+        annotations_dir = osp.join(root_dir, "annotations_positions")
+        if osp.isdir(annotations_dir):
+            logger.info(f"Checking annotations_positions folder: {annotations_dir}")
+            # Check frames backwards from current_frame_index - 1
+            for frame_idx in range(current_frame_index - 1, -1, -1):
+                for fmt in [f"{frame_idx:05d}.json", f"{frame_idx:08d}.json", f"{frame_idx:04d}.json", f"{frame_idx}.json"]:
+                    annotation_file = osp.join(annotations_dir, fmt)
+                    if osp.exists(annotation_file) and osp.getsize(annotation_file) > 0:
+                        # Check if file has valid content (not empty)
+                        try:
+                            with open(annotation_file, 'r') as f:
+                                data = json.load(f)
+                                if data and len(data) > 0:
+                                    logger.info(f"Found labels in annotations_positions for frame {frame_idx}: {annotation_file}")
+                                    return frame_idx
+                        except Exception as e:
+                            logger.debug(f"Error reading annotation file {annotation_file}: {e}")
+                            continue
+        
+        # Also check individual camera JSON files if in multi-camera mode
+        if self.is_multi_camera_mode:
+            # Get root dirs for scanning
+            root_dirs = None
+            if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                root_dirs = self._aicv_root_dir
+            elif hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+                root_dirs = self._multi_camera_root_dirs
+            elif self._prev_opened_dir:
+                root_dirs = self._prev_opened_dir
+            
+            if root_dirs:
+                logger.info(f"Checking individual camera JSON files, root_dirs: {root_dirs}, output_dir: {self.output_dir}")
+                for frame_idx in range(current_frame_index - 1, -1, -1):
+                    try:
+                        # Scan camera data for this frame (handles both AICV and legacy structures)
+                        camera_data = _scan_multi_camera_data(root_dirs, frame_idx)
+                        logger.debug(f"Scanned {len(camera_data)} cameras for frame {frame_idx}")
+                        
+                        # Check if any camera has labels for this frame
+                        for cam_data in camera_data:
+                            image_path = cam_data["image_path"]
+                            # Try original path first
+                            label_file = f"{osp.splitext(image_path)[0]}.json"
+                            
+                            # Check original location
+                            if osp.exists(label_file) and LabelFile.is_label_file(label_file):
+                                try:
+                                    label_file_obj = LabelFile(label_file)
+                                    if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
+                                        logger.info(f"Found labels in original location for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file}")
+                                        return frame_idx
+                                except Exception as e:
+                                    logger.debug(f"Error reading label file {label_file}: {e}")
+                            
+                            # Also check output_dir if set
+                            if self.output_dir:
+                                label_file_without_path = osp.basename(label_file)
+                                label_file_output = osp.join(self.output_dir, label_file_without_path)
+                                if osp.exists(label_file_output) and LabelFile.is_label_file(label_file_output):
+                                    try:
+                                        label_file_obj = LabelFile(label_file_output)
+                                        if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
+                                            logger.info(f"Found labels in output_dir for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file_output}")
+                                            return frame_idx
+                                    except Exception as e:
+                                        logger.debug(f"Error reading label file {label_file_output}: {e}")
+                    except Exception as e:
+                        logger.debug(f"Error checking frame {frame_idx}: {e}")
+                        continue
+        
+        logger.warning(f"No previous frame with labels found before frame {current_frame_index}")
+        return None
+
+    def _copy_labels_from_previous_frame(self) -> None:
+        """Copy all labels from the previous frame that has labels to the current frame"""
+        if not self.is_multi_camera_mode or not self.multi_camera_canvas:
+            self.errorMessage(
+                self.tr("Not supported"),
+                self.tr("This feature is only available in multi-camera mode."),
+            )
+            return
+        
+        current_frame_index = self._get_current_frame_index()
+        if current_frame_index <= 0:
+            self.errorMessage(
+                self.tr("No previous frame"),
+                self.tr("There is no previous frame to copy labels from."),
+            )
+            return
+        
+        # Find previous frame with labels
+        prev_frame_index = self._find_previous_frame_with_labels(current_frame_index)
+        if prev_frame_index is None:
+            self.errorMessage(
+                self.tr("No labels found"),
+                self.tr("No previous frame with labels found."),
+            )
+            return
+        
+        logger.info(f"Copying labels from frame {prev_frame_index} to frame {current_frame_index}")
+        
+        # Find root directory
+        root_dir = None
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        
+        if not root_dir:
+            self.errorMessage(
+                self.tr("Error"),
+                self.tr("Could not determine root directory."),
+            )
+            return
+        
+        # Check if AICV structure (loads from annotations_positions)
+        is_aicv = hasattr(self, "_aicv_root_dir") and self._aicv_root_dir is not None
+        
+        if is_aicv:
+            # For AICV structure, load from annotations_positions (same way as _load_global_annotations)
+            # Load the previous frame's annotations and reconstruct shapes
+            annotation_file = None
+            annotations_dir = osp.join(root_dir, "annotations_positions")
+            if osp.isdir(annotations_dir):
+                for fmt in [f"{prev_frame_index:05d}.json", f"{prev_frame_index:08d}.json", f"{prev_frame_index:04d}.json", f"{prev_frame_index}.json"]:
+                    path = osp.join(annotations_dir, fmt)
+                    if osp.exists(path):
+                        annotation_file = path
+                        break
+            
+            if not annotation_file:
+                self.errorMessage(
+                    self.tr("No labels found"),
+                    self.tr("No annotation file found for frame %d in annotations_positions.") % prev_frame_index,
+                )
+                return
+            
+            try:
+                with open(annotation_file, 'r') as f:
+                    annotations = json.load(f)
+                
+                logger.info(f"Loading {len(annotations)} annotations from {annotation_file}")
+                
+                # Load metadata (constants.json) to get default box sizes
+                metadata = load_metadata(root_dir)
+                default_box_width, default_box_height, default_box_depth = get_box_size_from_metadata(metadata)
+                
+                labels_loaded = False
+                total_shapes_loaded = 0
+                
+                # Track which personIDs have already had points added to BEV to avoid duplicates
+                person_ids_with_bev_points = set()
+                
+                # Reconstruct shapes from annotations (same logic as _load_global_annotations)
+                for person in annotations:
+                    person_id = person.get("personID")
+                    ground_points = person.get("ground_points")
+                    views = person.get("views", [])
+                    box_3d = person.get("box_3d")  # Load 3D box metadata if available
+                    locked = person.get("locked", False)
+                    
+                    if person_id is None:
+                        continue
+                    
+                    # Track if point was added to BEV
+                    point_added_to_bev = (person_id in person_ids_with_bev_points)
+                    
+                    # Add 3D box on BEV if box_3d metadata is available
+                    if self.bev_canvas and box_3d:
+                        try:
+                            # Extract 3D box parameters
+                            grid_x = box_3d.get("x", -1)
+                            grid_y = box_3d.get("y", -1)
+                            z = box_3d.get("z", 0)
+                            w = box_3d.get("w", default_box_width)
+                            h = box_3d.get("h", default_box_height)
+                            d = box_3d.get("d", default_box_depth)
+                            
+                            # Check if coordinates are valid
+                            if grid_x >= 0 and grid_y >= 0:
+                                # Transform to memory coordinates for BEV display
+                                mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                                
+                                # Create 3D box on BEV canvas
+                                center = np.array([mem_x, mem_y, z])
+                                size = np.array([w, h, d])
+                                rotation = 0.0  # Default rotation
+                                
+                                # Add box to BEV canvas
+                                self.bev_canvas.boxes_3d.append((center, size, rotation, "object", person_id))
+                                
+                                # Also add point (centroid) for this person
+                                if not point_added_to_bev:
+                                    self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                    if locked:
+                                        self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                    person_ids_with_bev_points.add(person_id)
+                                    point_added_to_bev = True
+                        except Exception as box_e:
+                            logger.warning(f"Failed to load 3D box for person {person_id}: {box_e}")
+                    
+                    # Add point (centroid) if not already added
+                    if self.bev_canvas and not point_added_to_bev:
+                        if ground_points and len(ground_points) >= 2:
+                            grid_x = ground_points[0]
+                            grid_y = ground_points[1]
+                            # Check if ground_points are valid (positive values)
+                            if grid_x >= 0 and grid_y >= 0:
+                                # Transform to memory coordinates for BEV display
+                                mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                                # Add point to BEV canvas
+                                if not point_added_to_bev:
+                                    self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                    if locked:
+                                        self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                    person_ids_with_bev_points.add(person_id)
+                                    point_added_to_bev = True
+                        
+                        # If still no point added, try to compute from views
+                        if not point_added_to_bev:
+                            for view in views:
+                                view_num = view.get("viewNum", -1)
+                                xmin = view.get("xmin", -1)
+                                ymin = view.get("ymin", -1)
+                                xmax = view.get("xmax", -1)
+                                ymax = view.get("ymax", -1)
+                                
+                                if xmin >= 0 and ymin >= 0 and xmax >= 0 and ymax >= 0:
+                                    # Try to project bbox to BEV
+                                    try:
+                                        from labelme.utils.project_bev import convert_bbox_to_bev
+                                        VIEW_TO_CAMERA = {}
+                                        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+                                            calibrations_dir = os.path.join(self._aicv_root_dir, "calibrations")
+                                            if os.path.exists(calibrations_dir):
+                                                camera_mapping = _get_aicv_camera_mapping(calibrations_dir)
+                                                for folder_num, cam_name in camera_mapping.items():
+                                                    try:
+                                                        view_num_int = int(folder_num)
+                                                        VIEW_TO_CAMERA[view_num_int] = cam_name
+                                                    except (ValueError, TypeError):
+                                                        continue
+                                        
+                                        if not VIEW_TO_CAMERA and view_num:
+                                            VIEW_TO_CAMERA[view_num] = f"Camera{view_num}"
+                                        
+                                        camera_name = VIEW_TO_CAMERA.get(view_num)
+                                        if camera_name:
+                                            bbox = [xmin, ymin, xmax, ymax]
+                                            if root_dir:
+                                                calib_folder = osp.join(root_dir, "calibrations")
+                                                if osp.exists(calib_folder):
+                                                    bev_coords = convert_bbox_to_bev(
+                                                        camera_name, bbox, calib_folder, z_world=0.0
+                                                    )
+                                                    if bev_coords:
+                                                        mem_x, mem_y = bev_coords
+                                                        if not point_added_to_bev:
+                                                            self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                                            if locked:
+                                                                self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                                            person_ids_with_bev_points.add(person_id)
+                                                            point_added_to_bev = True
+                                                            break
+                                    except Exception as e:
+                                        logger.debug(f"Failed to compute BEV from view {view_num}: {e}")
+                    
+                    # Add bounding boxes to camera views
+                    for view in views:
+                        view_num = view.get("viewNum", -1)
+                        xmin = view.get("xmin", -1)
+                        ymin = view.get("ymin", -1)
+                        xmax = view.get("xmax", -1)
+                        ymax = view.get("ymax", -1)
+                        
+                        # Skip invalid boxes
+                        if xmin < 0 or ymin < 0 or xmax < 0 or ymax < 0:
+                            continue
+                        
+                        # Find camera index by matching viewNum to camera_id
+                        expected_camera_id = f"Camera{view_num}"
+                        camera_idx = None
+                        
+                        for idx, cam_data in enumerate(self.multi_camera_data):
+                            camera_id = cam_data.get("camera_id", "")
+                            if camera_id == expected_camera_id:
+                                camera_idx = idx
+                                break
+                        
+                        # If not found by exact match, try to match by folder number
+                        if camera_idx is None:
+                            for idx, cam_data in enumerate(self.multi_camera_data):
+                                camera_id = cam_data.get("camera_id", "")
+                                match = re.search(r'(\d+)', camera_id)
+                                if match:
+                                    folder_num_from_id = int(match.group(1))
+                                    if folder_num_from_id == view_num:
+                                        camera_idx = idx
+                                        break
+                        
+                        if camera_idx is None or camera_idx < 0 or camera_idx >= len(self.multi_camera_canvas.camera_cells):
+                            continue
+                        
+                        # Create rectangle shape for this camera view
+                        shape = Shape(
+                            label="object",
+                            shape_type="rectangle",
+                            group_id=person_id,
+                        )
+                        shape.addPoint(QtCore.QPointF(xmin, ymin))
+                        shape.addPoint(QtCore.QPointF(xmax, ymax))
+                        shape.close()
+                        
+                        # Update shape color based on group_id
+                        self._update_shape_color(shape)
+                        
+                        # Restore locked state on shape if available
+                        if locked:
+                            shape._bev_locked = True
+                            self._update_shape_color(shape)
+                        
+                        # Add to the corresponding camera cell
+                        cell = self.multi_camera_canvas.camera_cells[camera_idx]
+                        cell.shapes.append(shape)
+                        self.multi_camera_canvas.camera_cells[camera_idx] = cell
+                        # Add to label list
+                        self.addLabel(shape)
+                        labels_loaded = True
+                        total_shapes_loaded += 1
+                
+                if labels_loaded:
+                    # Update BEV canvas to show copied points
+                    if self.bev_canvas:
+                        self.bev_canvas.update()
+                    self.multi_camera_canvas.update()
+                    self.setDirty()
+                    self.show_status_message(
+                        self.tr("Copied %d labels from frame %d") % (total_shapes_loaded, prev_frame_index)
+                    )
+                else:
+                    self.errorMessage(
+                        self.tr("No labels found"),
+                        self.tr("No valid labels found in annotation file for frame %d.") % prev_frame_index,
+                    )
+            except Exception as e:
+                logger.error(f"Failed to load annotations from {annotation_file}: {e}")
+                import traceback
+                traceback.print_exc()
+                self.errorMessage(
+                    self.tr("Error"),
+                    self.tr("Failed to load annotations: %s") % str(e),
+                )
+        else:
+            # For legacy mode, load from individual camera JSON files (same way as _load_multi_camera_frame)
+            root_dirs = None
+            if hasattr(self, "_multi_camera_root_dirs") and self._multi_camera_root_dirs:
+                root_dirs = self._multi_camera_root_dirs
+            elif self._prev_opened_dir:
+                root_dirs = self._prev_opened_dir
+            
+            if not root_dirs:
+                self.errorMessage(
+                    self.tr("Error"),
+                    self.tr("Could not determine root directory for scanning."),
+                )
+                return
+            
+            # Scan camera data for previous frame
+            try:
+                prev_camera_data = _scan_multi_camera_data(root_dirs, prev_frame_index)
+                logger.info(f"Scanned {len(prev_camera_data)} cameras for frame {prev_frame_index}")
+            except Exception as e:
+                logger.error(f"Failed to scan camera data for frame {prev_frame_index}: {e}")
+                self.errorMessage(
+                    self.tr("Error"),
+                    self.tr("Failed to scan camera data: %s") % str(e),
+                )
+                return
+            
+            # Load labels from each camera's JSON file (same logic as _load_multi_camera_frame)
+            labels_loaded = False
+            total_shapes_loaded = 0
+            
+            # Get current frame camera data to match cameras
+            current_camera_data = self.multi_camera_data if self.multi_camera_data else []
+            camera_id_to_idx = {cam_data.get("camera_id", ""): idx for idx, cam_data in enumerate(current_camera_data)}
+            
+            for prev_cam_data in prev_camera_data:
+                prev_camera_id = prev_cam_data.get("camera_id", "")
+                # Find corresponding camera index in current frame
+                current_idx = camera_id_to_idx.get(prev_camera_id, -1)
+                if current_idx < 0:
+                    logger.warning(f"Camera {prev_camera_id} not found in current frame, skipping")
+                    continue
+                
+                image_path = prev_cam_data["image_path"]
+                # Try original path first (same as _load_multi_camera_frame)
+                label_file = f"{osp.splitext(image_path)[0]}.json"
+                if self.output_dir:
+                    label_file_without_path = osp.basename(label_file)
+                    label_file = osp.join(self.output_dir, label_file_without_path)
+                
+                if QtCore.QFile.exists(label_file) and LabelFile.is_label_file(label_file):
+                    try:
+                        label_file_obj = LabelFile(label_file)
+                        if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
+                            # Load shapes (same logic as _load_multi_camera_frame)
+                            shapes = []
+                            for shape_dict in label_file_obj.shapes:
+                                shape = Shape(
+                                    label=shape_dict["label"],
+                                    shape_type=shape_dict["shape_type"],
+                                    group_id=shape_dict.get("group_id"),
+                                    description=shape_dict.get("description"),
+                                )
+                                for x, y in shape_dict["points"]:
+                                    shape.addPoint(QtCore.QPointF(x, y))
+                                shape.close()
+                                # Preserve from_bev flag if it exists
+                                if "other_data" in shape_dict and "from_bev" in shape_dict["other_data"]:
+                                    shape.other_data["from_bev"] = shape_dict["other_data"]["from_bev"]
+                                shapes.append(shape)
+                            
+                            # Add shapes to current frame's corresponding camera cell
+                            if current_idx < len(self.multi_camera_canvas.camera_cells):
+                                cell = self.multi_camera_canvas.camera_cells[current_idx]
+                                for shape in shapes:
+                                    cell.shapes.append(shape)
+                                    self.addLabel(shape)
+                                self.multi_camera_canvas.camera_cells[current_idx] = cell
+                                labels_loaded = True
+                                total_shapes_loaded += len(shapes)
+                                logger.info(f"Loaded {len(shapes)} shapes from camera {prev_camera_id} (frame {prev_frame_index}) -> camera {current_idx} (frame {current_frame_index})")
+                    except Exception as e:
+                        logger.warning(f"Failed to load label file {label_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            if labels_loaded:
+                self.multi_camera_canvas.update()
+                self.setDirty()
+                self.show_status_message(
+                    self.tr("Copied %d labels from frame %d") % (total_shapes_loaded, prev_frame_index)
+                )
+            else:
+                self.errorMessage(
+                    self.tr("No labels found"),
+                    self.tr("No label files found for frame %d. Make sure you have saved labels for frame %d first.") % (prev_frame_index, prev_frame_index),
+                )
 
     def duplicateSelectedShape(self):
         self.copySelectedShape()
