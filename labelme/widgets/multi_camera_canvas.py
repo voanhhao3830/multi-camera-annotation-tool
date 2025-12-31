@@ -1269,25 +1269,93 @@ class MultiCameraCanvas(QtWidgets.QWidget):
         self.update()
 
     def loadShapes(self, shapes: list[Shape], replace: bool = True):
-        """Load shapes into the current cell"""
-        if self.current_cell_index is None or self.current_cell_index >= len(self.camera_cells):
+        """Load shapes into the correct cells based on which cell each shape belongs to"""
+        if not self.camera_cells:
             return
         
-        cell = self.camera_cells[self.current_cell_index]
-        if replace:
-            new_shapes = []
-        else:
-            new_shapes = cell.shapes.copy()
-        
-        # Ensure all shapes are within cell bounds
-        for shape in shapes:
-            if self._is_shape_in_cell_bounds(shape, cell):
-                new_shapes.append(shape)
+        # If current_cell_index is set and we're loading a small number of shapes,
+        # assume they belong to the current cell (for normal drawing operations)
+        # But if we're loading many shapes (like from undo), distribute them to correct cells
+        if self.current_cell_index is not None and self.current_cell_index < len(self.camera_cells) and len(shapes) <= 10:
+            # Small number of shapes - load into current cell (normal drawing)
+            cell = self.camera_cells[self.current_cell_index]
+            if replace:
+                new_shapes = []
             else:
-                logger.warning(f"Shape {shape.label} is outside cell bounds, skipping")
+                new_shapes = cell.shapes.copy()
+            
+            # Ensure all shapes are within cell bounds
+            for shape in shapes:
+                if self._is_shape_in_cell_bounds(shape, cell):
+                    new_shapes.append(shape)
+                else:
+                    logger.warning(f"Shape {shape.label} is outside cell bounds, skipping")
+            
+            # Update cell
+            self.camera_cells[self.current_cell_index] = cell._replace(shapes=new_shapes)
+        else:
+            # Large number of shapes or current_cell_index not set - distribute to correct cells
+            # Save fullscreen state and temporarily exit fullscreen to calculate layout correctly
+            saved_fullscreen = self.fullscreen_cell_index
+            if saved_fullscreen is not None:
+                self.fullscreen_cell_index = None
+            
+            # Calculate layout in multi-camera mode so all cells have proper bounds
+            if self.camera_cells and (not self.camera_cells[0].cell_rect.width() or not self.camera_cells[0].cell_rect.height()):
+                self._calculate_cell_layout(self.width(), self.height())
+            
+            # Group shapes by which cell they belong to
+            # First, check if shapes already exist in cells (by object identity)
+            shapes_by_cell: dict[int, list[Shape]] = {}
+            existing_shapes_by_cell: dict[int, set[Shape]] = {}
+            for idx, cell in enumerate(self.camera_cells):
+                existing_shapes_by_cell[idx] = set(cell.shapes)
+            
+            for shape in shapes:
+                shape_assigned = False
+                
+                # First, check if shape already exists in a cell (by object identity)
+                for idx, existing_shapes in existing_shapes_by_cell.items():
+                    if shape in existing_shapes:
+                        # Shape already exists in this cell, keep it here
+                        if idx not in shapes_by_cell:
+                            shapes_by_cell[idx] = []
+                        shapes_by_cell[idx].append(shape)
+                        shape_assigned = True
+                        break
+                
+                if not shape_assigned:
+                    # Shape doesn't exist yet, find which cell it belongs to by checking bounds
+                    for idx, cell in enumerate(self.camera_cells):
+                        if self._is_shape_in_cell_bounds(shape, cell):
+                            if idx not in shapes_by_cell:
+                                shapes_by_cell[idx] = []
+                            shapes_by_cell[idx].append(shape)
+                            shape_assigned = True
+                            break
+                
+                if not shape_assigned:
+                    logger.warning(f"Shape {shape.label} does not belong to any cell, skipping")
+            
+            # Load shapes into their respective cells
+            for cell_idx, cell_shapes in shapes_by_cell.items():
+                if cell_idx >= len(self.camera_cells):
+                    continue
+                
+                cell = self.camera_cells[cell_idx]
+                if replace:
+                    new_shapes = []
+                else:
+                    new_shapes = cell.shapes.copy()
+                
+                new_shapes.extend(cell_shapes)
+                self.camera_cells[cell_idx] = cell._replace(shapes=new_shapes)
+            
+            # Restore fullscreen mode if it was active
+            if saved_fullscreen is not None:
+                self.fullscreen_cell_index = saved_fullscreen
+                self._calculate_cell_layout(self.width(), self.height())
         
-        # Update cell
-        self.camera_cells[self.current_cell_index] = cell._replace(shapes=new_shapes)
         self.update()
 
     def getShapes(self) -> list[Shape]:

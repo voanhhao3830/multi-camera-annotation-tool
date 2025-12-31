@@ -1292,9 +1292,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.canvas.restoreShape()
         self.labelList.clear()
         if self.is_multi_camera_mode and self.multi_camera_canvas:
-            # Reload all shapes from all cells
+            # restoreShape() already restored shapes to their correct cells
+            # Just update the label list, don't reload shapes (which would cause them to be loaded into wrong cell)
             all_shapes = self.multi_camera_canvas.getShapes()
-            self._load_shapes(all_shapes)
+            self.labelList.itemSelectionChanged.disconnect(self._label_selection_changed)
+            for shape in all_shapes:
+                self.addLabel(shape)
+            self.labelList.clearSelection()
+            self.labelList.itemSelectionChanged.connect(self._label_selection_changed)
         else:
             self._load_shapes(self.canvas.shapes)
         self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
@@ -3567,7 +3572,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def labelOrderChanged(self):
         self.setDirty()
-        self.canvas.loadShapes([item.shape() for item in self.labelList])
+        # In multi-camera mode, shapes are already stored in their correct cells
+        # Don't reload shapes as it would cause them to be redistributed incorrectly
+        # Only reload in regular mode where shapes are stored directly in canvas
+        if not (self.is_multi_camera_mode and self.multi_camera_canvas):
+            self.canvas.loadShapes([item.shape() for item in self.labelList])
 
     # Callback functions:
 
