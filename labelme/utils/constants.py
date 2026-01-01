@@ -22,27 +22,31 @@ DEFAULT_BOX_HEIGHT = 50.0  # Height of bounding box
 DEFAULT_BOX_DEPTH = 50.0  # Depth of bounding box
 DEFAULT_BOX_SIZE = 50.0  # Legacy: kept for backward compatibility
 
+IMAGE_WIDTH = 960
+IMAGE_HEIGHT = 540
+
 # ============================================================================
 # World Grid to World Coordinate Transformation
 # ============================================================================
 
 # Rotation angle for world grid alignment
-WORLD_GRID_THETA = -1  # degrees
+WORLD_GRID_THETA = -2  # degrees
 WORLD_GRID_THETA_RAD = WORLD_GRID_THETA / 180.0 * np.pi
 
 # Scale factor for grid to world conversion
-WORLD_GRID_SCALE = 0.5
+WORLD_GRID_SCALE = 2.5
 
 # Translation offset for grid to world conversion
-WORLD_GRID_TX = -78
-WORLD_GRID_TY = -116
+WORLD_GRID_TX = -76
+WORLD_GRID_TY = -112
 
 # World grid to world coordinate transformation matrix (3x3 homogeneous)
 # Converts world grid coordinates to world coordinates (meters)
 WORLDGRID2WORLDCOORD_MAT = np.array([
-    [WORLD_GRID_SCALE * np.cos(WORLD_GRID_THETA_RAD), WORLD_GRID_SCALE * -np.sin(WORLD_GRID_THETA_RAD), WORLD_GRID_TX],
-    [WORLD_GRID_SCALE * np.sin(WORLD_GRID_THETA_RAD), WORLD_GRID_SCALE *  np.cos(WORLD_GRID_THETA_RAD), WORLD_GRID_TY],
-    [0.,                                              0.,                                                1.]
+    [WORLD_GRID_SCALE * np.cos(WORLD_GRID_THETA_RAD), WORLD_GRID_SCALE * -np.sin(WORLD_GRID_THETA_RAD), 0, WORLD_GRID_TX],
+    [WORLD_GRID_SCALE * np.sin(WORLD_GRID_THETA_RAD), WORLD_GRID_SCALE *  np.cos(WORLD_GRID_THETA_RAD), 0,WORLD_GRID_TY],
+    [0.,                     0.,                     1. ,   0.],
+    [0.,                     0.,                     0. ,   1.],
 ], dtype=np.float32)
 
 # Inverse: World coordinate to world grid
@@ -54,12 +58,12 @@ WORLDCOORD2WORLDGRID_MAT = np.linalg.inv(WORLDGRID2WORLDCOORD_MAT).astype(np.flo
 # ============================================================================
 
 # Default BEV grid dimensions
-DEFAULT_BEV_X = 512 * 2   # Grid X dimension (pixels)
-DEFAULT_BEV_Y = 408 * 2   # Grid Y dimension (pixels)
+DEFAULT_BEV_X = int(200)   # Grid X dimension (pixels)
+DEFAULT_BEV_Y = int(160 )  # Grid Y dimension (pixels)
 DEFAULT_BEV_Z = 2     # Grid Z dimension (height levels)
 
 # Default BEV bounds in world units [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
-DEFAULT_BEV_BOUNDS = [0, 512 * 2, 0, 408 * 2, 0, 2]
+DEFAULT_BEV_BOUNDS = [0, int(200), 0, int(160), 0, 2]
 
 
 # ============================================================================

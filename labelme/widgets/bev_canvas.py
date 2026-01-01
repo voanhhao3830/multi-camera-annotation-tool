@@ -781,7 +781,7 @@ class BEVCanvas(QtWidgets.QWidget):
         
         # Update tooltip with grid coordinates
         x, y = self._screen_to_grid(pos)
-        self.setToolTip(f"Grid X: {x:.1f}, Grid Y: {y:.1f}")
+        # self.setToolTip(f"Grid X: {x:.1f}, Grid Y: {y:.1f}")
         
         # Emit mouse position for real-time projection to cameras
         self.mousePositionChanged.emit(x, y)

@@ -60,12 +60,8 @@ def run_yolo_detection(
     Returns:
         Number of frames with detections created
     """
-    try:
-        from ultralytics import YOLO
-        import cv2
-    except ImportError as e:
-        logger.error(f"Failed to import YOLO dependencies: {e}")
-        raise ImportError("ultralytics and cv2 are required for YOLO detection")
+    from ultralytics import YOLO
+    import cv2
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"YOLO model not found: {model_path}")

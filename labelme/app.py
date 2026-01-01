@@ -5186,20 +5186,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Look for intrinsic and extrinsic XML files
                 intrinsic_original_dir = osp.join(calibration_path, "intrinsic_original")
                 extrinsic_dir = osp.join(calibration_path, "extrinsic")
+                optimal_intrinsic_dir = osp.join(calibration_path, "intrinsic_optimal")
                 
-                if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir):
+                if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir) and osp.isdir(optimal_intrinsic_dir):
                     # Find XML files
                     intrinsic_files = [f for f in os.listdir(intrinsic_original_dir) if f.endswith('.xml')]
                     extrinsic_files = [f for f in os.listdir(extrinsic_dir) if f.endswith('.xml')]
-                    
-                    if intrinsic_files and extrinsic_files:
+                    optimal_intrinsic_files = [f for f in os.listdir(optimal_intrinsic_dir) if f.endswith('.xml')]
+                    if intrinsic_files and extrinsic_files and optimal_intrinsic_files:
                         intrinsic_path = osp.join(intrinsic_original_dir, intrinsic_files[0])
                         extrinsic_path = osp.join(extrinsic_dir, extrinsic_files[0])
-                        
+                        optimal_intrinsic_path = osp.join(optimal_intrinsic_dir, optimal_intrinsic_files[0])
                         # Load calibration with default scale factors
                         calibration = CameraCalibration.load_from_xml_files_scaled(
+                            camera_id,
                             intrinsic_path, 
                             extrinsic_path,
+                            optimal_intrinsic_path=optimal_intrinsic_path,
                             intrinsic_scale=self._intrinsic_scale_factor,
                             translation_scale=self._translation_scale_factor
                         )
@@ -5570,34 +5573,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Generate BEV overlay image directly from camera images and calibration.
             # This samples the ground plane (z=0) into a top-down mosaic.
-            try:
-                bev_image = generate_bev_from_cameras(
-                    self.camera_calibrations,
-                    self.multi_camera_data,
-                    bev_width,
-                    bev_height,
-                    resolution=max(bev_width, bev_height) / 512.0,
-                    bev_x=self._bev_x,
-                    bev_y=self._bev_y,
-                    bev_bounds=self._bev_bounds,
-                )
-                if bev_image is not None:
-                    h, w, _ = bev_image.shape
-                    # Convert numpy RGB array to QImage
-                    qimg = QtGui.QImage(
-                        bev_image.data,
-                        w,
-                        h,
-                        3 * w,
-                        QtGui.QImage.Format_RGB888,
-                    ).copy()
+            bev_image = generate_bev_from_cameras(
+                self.camera_calibrations,
+                self.multi_camera_data,
+                bev_width,
+                bev_height,
+                resolution=max(bev_width, bev_height) / 512.0,
+                bev_x=self._bev_x,
+                bev_y=self._bev_y,
+                bev_bounds=self._bev_bounds,
+            )
+            if bev_image is not None:
+                h, w, _ = bev_image.shape
+                # Convert numpy RGB array to QImage
+                qimg = QtGui.QImage(
+                    bev_image.data,
+                    w,
+                    h,
+                    3 * w,
+                    QtGui.QImage.Format_RGB888,
+                ).copy()
 
-                    # Set BEV background to generated overlay
-                    self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
-                    logger.info("Generated BEV overlay image from cameras")
-            except Exception as e:
-                logger.warning(f"Failed to generate BEV overlay image: {e}")
-        
+                # Set BEV background to generated overlay
+                self.bev_canvas.setBackgroundImage(qimg, alpha=1.0)
+                logger.info("Generated BEV overlay image from cameras")
+
         # Connect signals
         self.bev_canvas.boxPlaced.connect(self._on_bev_box_placed)
         self.bev_canvas.boxMoved.connect(self._on_bev_box_moved)
@@ -6064,54 +6064,76 @@ class MainWindow(QtWidgets.QMainWindow):
                             shape_to_update = shape
                             break
                     
-                    # Check if projected point is within image bounds
-                    if 0 <= new_center_x < img_w and 0 <= new_center_y < img_h:
-                        # Projection is within bounds - update or create shape
+                    # Calculate new bounding box centered on projected point
+                    # Get current bounding box dimensions if shape exists
+                    width = None
+                    height = None
+                    if shape_to_update and len(shape_to_update.points) >= 2:
+                        old_xmin = min(p.x() for p in shape_to_update.points)
+                        old_xmax = max(p.x() for p in shape_to_update.points)
+                        old_ymin = min(p.y() for p in shape_to_update.points)
+                        old_ymax = max(p.y() for p in shape_to_update.points)
+                        width = old_xmax - old_xmin
+                        height = old_ymax - old_ymin
+                    
+                    # If no existing shape, try to get dimensions from other cameras
+                    if width is None or height is None:
+                        for other_cam_idx, other_cam_data in enumerate(self.multi_camera_data):
+                            if other_cam_idx == cam_idx:
+                                continue
+                            other_cell = self.multi_camera_canvas.camera_cells[other_cam_idx]
+                            for other_shape in other_cell.shapes:
+                                if (other_shape.group_id == group_id and 
+                                    len(other_shape.points) >= 2):
+                                    other_xmin = min(p.x() for p in other_shape.points)
+                                    other_xmax = max(p.x() for p in other_shape.points)
+                                    other_ymin = min(p.y() for p in other_shape.points)
+                                    other_ymax = max(p.y() for p in other_shape.points)
+                                    width = other_xmax - other_xmin
+                                    height = other_ymax - other_ymin
+                                    break
+                            if width is not None:
+                                break
+                    
+                    # Use default dimensions if not found
+                    if width is None or height is None:
+                        width = 100.0  # Default width in pixels
+                        height = 200.0  # Default height in pixels
+                    
+                    # Calculate new bounding box centered on projected point
+                    # Keep bottom of box at projected point (foot position)
+                    new_xmin = new_center_x - width / 2
+                    new_xmax = new_center_x + width / 2
+                    new_ymax = new_center_y  # Foot at projected point
+                    new_ymin = new_center_y - height
+                    
+                    # Clamp bounding box to image bounds (only remove if completely outside)
+                    clamped_bbox = self._clamp_bbox_to_image_bounds(new_xmin, new_ymin, new_xmax, new_ymax, img_w, img_h)
+                    if clamped_bbox is None:
+                        # Bbox is completely outside bounds - remove shape if it exists and is from BEV
+                        if shape_to_update and shape_to_update.other_data.get("from_bev", True):
+                            cell.shapes.remove(shape_to_update)
+                            self.remLabels([shape_to_update])
+                    else:
+                        # Use clamped coordinates
+                        new_xmin, new_ymin, new_xmax, new_ymax = clamped_bbox
+                        
+                        # Update or create shape
                         if shape_to_update:
-                            # Get current bounding box dimensions
-                            if len(shape_to_update.points) >= 2:
-                                old_xmin = min(p.x() for p in shape_to_update.points)
-                                old_xmax = max(p.x() for p in shape_to_update.points)
-                                old_ymin = min(p.y() for p in shape_to_update.points)
-                                old_ymax = max(p.y() for p in shape_to_update.points)
-                                
-                                # Calculate current dimensions
-                                width = old_xmax - old_xmin
-                                height = old_ymax - old_ymin
-                                
-                                # Calculate new bounding box centered on projected point
-                                # Keep bottom of box at projected point (foot position)
-                                new_xmin = new_center_x - width / 2
-                                new_xmax = new_center_x + width / 2
-                                new_ymax = new_center_y  # Foot at projected point
-                                new_ymin = new_center_y - height
-                                
-                                # Check if new bbox is within bounds
-                                if new_xmin >= 0 and new_ymin >= 0 and new_xmax <= img_w and new_ymax <= img_h:
-                                    # Update shape points (for rectangle: top-left, bottom-right)
-                                    if len(shape_to_update.points) == 2:
-                                        shape_to_update.points[0] = QtCore.QPointF(new_xmin, new_ymin)
-                                        shape_to_update.points[1] = QtCore.QPointF(new_xmax, new_ymax)
-                                    elif len(shape_to_update.points) == 4:
-                                        # Rectangle with 4 corners
-                                        shape_to_update.points[0] = QtCore.QPointF(new_xmin, new_ymin)
-                                        shape_to_update.points[1] = QtCore.QPointF(new_xmax, new_ymin)
-                                        shape_to_update.points[2] = QtCore.QPointF(new_xmax, new_ymax)
-                                        shape_to_update.points[3] = QtCore.QPointF(new_xmin, new_ymax)
-                                    # Mark as from BEV
-                                    shape_to_update.other_data["from_bev"] = True
-                                else:
-                                    # New bbox is outside bounds - remove shape (only if from BEV)
-                                    if shape_to_update.other_data.get("from_bev", True):
-                                        cell.shapes.remove(shape_to_update)
-                                        self.remLabels([shape_to_update])
-                            else:
-                                # Shape has invalid points - remove it (only if from BEV)
-                                if shape_to_update.other_data.get("from_bev", True):
-                                    cell.shapes.remove(shape_to_update)
-                                    self.remLabels([shape_to_update])
+                            # Update shape points (for rectangle: top-left, bottom-right)
+                            if len(shape_to_update.points) == 2:
+                                shape_to_update.points[0] = QtCore.QPointF(new_xmin, new_ymin)
+                                shape_to_update.points[1] = QtCore.QPointF(new_xmax, new_ymax)
+                            elif len(shape_to_update.points) == 4:
+                                # Rectangle with 4 corners
+                                shape_to_update.points[0] = QtCore.QPointF(new_xmin, new_ymin)
+                                shape_to_update.points[1] = QtCore.QPointF(new_xmax, new_ymin)
+                                shape_to_update.points[2] = QtCore.QPointF(new_xmax, new_ymax)
+                                shape_to_update.points[3] = QtCore.QPointF(new_xmin, new_ymax)
+                            # Mark as from BEV
+                            shape_to_update.other_data["from_bev"] = True
                         else:
-                            # Shape doesn't exist - create new one if point is in bounds
+                            # Shape doesn't exist - create new one
                             # Get label from BEV point
                             point_label = "object"  # Default label
                             if self.bev_canvas:
@@ -6120,62 +6142,23 @@ class MainWindow(QtWidgets.QMainWindow):
                                         point_label = label
                                         break
                             
-                            # Try to get box dimensions from another camera with same group_id
-                            width = None
-                            height = None
-                            for other_cam_idx, other_cam_data in enumerate(self.multi_camera_data):
-                                if other_cam_idx == cam_idx:
-                                    continue
-                                other_cell = self.multi_camera_canvas.camera_cells[other_cam_idx]
-                                for other_shape in other_cell.shapes:
-                                    if (other_shape.group_id == group_id and 
-                                        len(other_shape.points) >= 2):
-                                        other_xmin = min(p.x() for p in other_shape.points)
-                                        other_xmax = max(p.x() for p in other_shape.points)
-                                        other_ymin = min(p.y() for p in other_shape.points)
-                                        other_ymax = max(p.y() for p in other_shape.points)
-                                        width = other_xmax - other_xmin
-                                        height = other_ymax - other_ymin
-                                        break
-                                if width is not None:
-                                    break
+                            # Create new shape
+                            new_shape = Shape(
+                                label=point_label,
+                                shape_type="rectangle",
+                                group_id=group_id,
+                            )
+                            new_shape.addPoint(QtCore.QPointF(new_xmin, new_ymin))
+                            new_shape.addPoint(QtCore.QPointF(new_xmax, new_ymax))
+                            new_shape.close()
+                            new_shape.other_data["from_bev"] = True
                             
-                            # Use default dimensions if not found
-                            if width is None or height is None:
-                                # Default box size (can be adjusted)
-                                width = 100.0  # Default width in pixels
-                                height = 200.0  # Default height in pixels
+                            # Add to cell
+                            cell.shapes.append(new_shape)
+                            self.multi_camera_canvas.camera_cells[cam_idx] = cell
                             
-                            # Calculate bounding box centered on projected point
-                            new_xmin = new_center_x - width / 2
-                            new_xmax = new_center_x + width / 2
-                            new_ymax = new_center_y  # Foot at projected point
-                            new_ymin = new_center_y - height
-                            
-                            # Check if new bbox is within bounds
-                            if new_xmin >= 0 and new_ymin >= 0 and new_xmax <= img_w and new_ymax <= img_h:
-                                # Create new shape
-                                new_shape = Shape(
-                                    label=point_label,
-                                    shape_type="rectangle",
-                                    group_id=group_id,
-                                )
-                                new_shape.addPoint(QtCore.QPointF(new_xmin, new_ymin))
-                                new_shape.addPoint(QtCore.QPointF(new_xmax, new_ymax))
-                                new_shape.close()
-                                new_shape.other_data["from_bev"] = True
-                                
-                                # Add to cell
-                                cell.shapes.append(new_shape)
-                                self.multi_camera_canvas.camera_cells[cam_idx] = cell
-                                
-                                # Add to label list
-                                self.addLabel(new_shape)
-                    else:
-                        # Projected point is outside bounds - remove shape if it exists and is from BEV
-                        if shape_to_update and shape_to_update.other_data.get("from_bev", True):
-                            cell.shapes.remove(shape_to_update)
-                            self.remLabels([shape_to_update])
+                            # Add to label list
+                            self.addLabel(new_shape)
                     
                     # Update cell
                     self.multi_camera_canvas.camera_cells[cam_idx] = cell
@@ -6220,36 +6203,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             
             # Project the BEV mouse position to this camera
-            try:
-                projected = calibration.project_mem_to_2d(
-                    mem_point,
-                    bev_x=self._bev_x,
-                    bev_y=self._bev_y,
-                    bev_bounds=self._bev_bounds,
-                    apply_distortion=True
-                )
-                
-                if projected is None or np.isnan(projected).any():
-                    markers[camera_id] = None
-                    continue
-                
-                proj_x, proj_y = projected[0]
-                
-                # Check if projection is within image bounds
-                cell = self.multi_camera_canvas.camera_cells[cam_idx] if cam_idx < len(self.multi_camera_canvas.camera_cells) else None
-                if cell and cell.image.width() > 0 and cell.image.height() > 0:
-                    # Check if within image bounds
-                    if 0 <= proj_x < cell.image.width() and 0 <= proj_y < cell.image.height():
-                        # Store marker position in cell/image coordinates
-                        markers[camera_id] = QtCore.QPointF(proj_x, proj_y)
-                    else:
-                        markers[camera_id] = None
+            projected = calibration.project_mem_to_2d(
+                mem_point,
+                bev_x=self._bev_x,
+                bev_y=self._bev_y,
+                bev_bounds=self._bev_bounds,
+                apply_distortion=True
+            )
+            
+            if projected is None or np.isnan(projected).any():
+                markers[camera_id] = None
+                continue
+            
+            proj_x, proj_y = projected[0]
+            
+            # Check if projection is within image bounds
+            cell = self.multi_camera_canvas.camera_cells[cam_idx] if cam_idx < len(self.multi_camera_canvas.camera_cells) else None
+            if cell and cell.image.width() > 0 and cell.image.height() > 0:
+                # Check if within image bounds
+                if 0 <= proj_x < cell.image.width() and 0 <= proj_y < cell.image.height():
+                    # Store marker position in cell/image coordinates
+                    markers[camera_id] = QtCore.QPointF(proj_x, proj_y)
                 else:
                     markers[camera_id] = None
-                    
-            except Exception as e:
-                logger.debug(f"Failed to project BEV mouse position to camera {camera_id}: {e}")
+            else:
                 markers[camera_id] = None
+                    
         
         # Update markers in multi-camera canvas
         self.multi_camera_canvas.setBEVProjectionMarkers(markers)
@@ -6278,6 +6257,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # This ensures that even if only lock/unlock is done, the state is saved
         self._save_global_annotations()
     
+    def _clamp_bbox_to_image_bounds(
+        self, x_min: float, y_min: float, x_max: float, y_max: float, 
+        img_w: int, img_h: int
+    ) -> tuple[float, float, float, float] | None:
+        """
+        Clamp bounding box to image bounds.
+        
+        Args:
+            x_min, y_min, x_max, y_max: Bounding box coordinates
+            img_w, img_h: Image dimensions
+            
+        Returns:
+            (clamped_x_min, clamped_y_min, clamped_x_max, clamped_y_max) if bbox overlaps with image,
+            None if bbox is completely outside image bounds
+        """
+        # Check if bbox is completely outside image bounds (no overlap)
+        if x_max < 0 or x_min > img_w or y_max < 0 or y_min > img_h:
+            return None
+        
+        # Clamp to image bounds
+        clamped_x_min = max(0.0, x_min)  # Clamp min to at least 0
+        clamped_y_min = max(0.0, y_min)  # Clamp min to at least 0
+        clamped_x_max = min(float(img_w), x_max)  # Clamp max to at most img_w
+        clamped_y_max = min(float(img_h), y_max)  # Clamp max to at most img_h
+        
+        # Ensure min < max after clamping
+        if clamped_x_min >= clamped_x_max or clamped_y_min >= clamped_y_max:
+            return None
+        
+        return (clamped_x_min, clamped_y_min, clamped_x_max, clamped_y_max)
+    
     def _project_3d_box_to_cameras(self, x: float, y: float, z: float, 
                                    w: float, h: float, d: float,
                                    label: str, group_id: Optional[int]):
@@ -6290,6 +6300,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Project to each camera
         for idx, cam_data in enumerate(self.multi_camera_data):
+            print(f"Projecting 3D box to camera {idx}")
             camera_id = cam_data["camera_id"]
             calibration = self.camera_calibrations.get(camera_id)
             
@@ -6316,12 +6327,30 @@ class MainWindow(QtWidgets.QMainWindow):
             x_max = np.max(valid_corners[:, 0])
             y_max = np.max(valid_corners[:, 1])
             
-            # Check if bbox is within image bounds.
-            # If it goes completely or partially outside, we treat it as not visible
-            # so that the box disappears instead of sticking to the border.
             cell = self.multi_camera_canvas.camera_cells[idx]
             img_w = cell.image.width()
             img_h = cell.image.height()
+            
+            # Clamp bounding box to image bounds (only remove if completely outside)
+            clamped_bbox = self._clamp_bbox_to_image_bounds(x_min, y_min, x_max, y_max, img_w, img_h)
+            if clamped_bbox is None:
+                logger.debug(f"Box completely outside image bounds for camera {camera_id}, removing projection")
+                # Remove existing BEV-projected shape if it exists
+                shapes_to_remove = []
+                for shape in cell.shapes:
+                    if (shape.label == label and shape.group_id == group_id and 
+                        shape.other_data.get("from_bev", False)):
+                        shapes_to_remove.append(shape)
+                
+                for shape in shapes_to_remove:
+                    cell.shapes.remove(shape)
+                    self.remLabels([shape])
+                
+                self.multi_camera_canvas.camera_cells[idx] = cell
+                continue
+            
+            # Use clamped coordinates
+            x_min, y_min, x_max, y_max = clamped_bbox
             
             # If the user manually edited this box on this camera (from_bev == False),
             # stop tracking it from BEV and do not create a new box for this camera.
