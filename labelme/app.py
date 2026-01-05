@@ -5068,18 +5068,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 if calibration_path and osp.isdir(calibration_path):
                     intrinsic_original_dir = osp.join(calibration_path, "intrinsic_original")
                     extrinsic_dir = osp.join(calibration_path, "extrinsic")
+                    optimal_intrinsic_dir = osp.join(calibration_path, "intrinsic_optimal")
                     
-                    if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir):
+                    if osp.isdir(intrinsic_original_dir) and osp.isdir(extrinsic_dir) and osp.isdir(optimal_intrinsic_dir):
                         intrinsic_files = [f for f in os.listdir(intrinsic_original_dir) if f.endswith('.xml')]
                         extrinsic_files = [f for f in os.listdir(extrinsic_dir) if f.endswith('.xml')]
-                        
-                        if intrinsic_files and extrinsic_files:
+                        optimal_intrinsic_files = [f for f in os.listdir(optimal_intrinsic_dir) if f.endswith('.xml')]
+                        if intrinsic_files and extrinsic_files and optimal_intrinsic_files:
                             intrinsic_path = osp.join(intrinsic_original_dir, intrinsic_files[0])
                             extrinsic_path = osp.join(extrinsic_dir, extrinsic_files[0])
-                            
+                            optimal_intrinsic_path = osp.join(optimal_intrinsic_dir, optimal_intrinsic_files[0])
                             calibration = CameraCalibration.load_from_xml_files_scaled(
+                                camera_id,
                                 intrinsic_path,
                                 extrinsic_path,
+                                optimal_intrinsic_path,
                                 intrinsic_scale=self._intrinsic_scale_factor,
                                 translation_scale=self._translation_scale_factor
                             )

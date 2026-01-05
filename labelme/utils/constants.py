@@ -17,10 +17,10 @@ from typing import Tuple, List
 # ============================================================================
 
 # Default box size (width, height, depth) in world grid units
-DEFAULT_BOX_WIDTH = 50.0  # Width of bounding box
-DEFAULT_BOX_HEIGHT = 50.0  # Height of bounding box  
-DEFAULT_BOX_DEPTH = 50.0  # Depth of bounding box
-DEFAULT_BOX_SIZE = 50.0  # Legacy: kept for backward compatibility
+DEFAULT_BOX_WIDTH = 10.0  # Width of bounding box
+DEFAULT_BOX_HEIGHT = 10.0  # Height of bounding box  
+DEFAULT_BOX_DEPTH = 10.0  # Depth of bounding box
+DEFAULT_BOX_SIZE = 10.0  # Legacy: kept for backward compatibility
 
 IMAGE_WIDTH = 960
 IMAGE_HEIGHT = 540
