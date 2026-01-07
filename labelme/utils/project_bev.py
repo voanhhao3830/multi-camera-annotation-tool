@@ -37,9 +37,10 @@ class BEVProjector:
         """Load camera calibrations from XML files using CameraCalibration"""
         intrinsic_path = os.path.join(self.calib_path, 'intrinsic')
         extrinsic_path = os.path.join(self.calib_path, 'extrinsic')
+        optimal_intrinsic_path = os.path.join(self.calib_path, 'intrinsic_optimal')
         
-        if not os.path.exists(intrinsic_path) or not os.path.exists(extrinsic_path):
-            print(f"Warning: Calibration paths not found: {intrinsic_path} or {extrinsic_path}")
+        if not os.path.exists(intrinsic_path) or not os.path.exists(extrinsic_path) or not os.path.exists(optimal_intrinsic_path):
+            print(f"Warning: Calibration paths not found: {intrinsic_path} or {extrinsic_path} or {optimal_intrinsic_path}")
             return
         
         camera_names = []
@@ -54,11 +55,13 @@ class BEVProjector:
         for cam_name in camera_names:
             intr_file = os.path.join(intrinsic_path, f'intr_{cam_name}.xml')
             extr_file = os.path.join(extrinsic_path, f'extr_{cam_name}.xml')
+            optimal_intr_file = os.path.join(optimal_intrinsic_path, f'intr_{cam_name}.xml')
             
             # Load calibration using CameraCalibration class with provided scale factors
             calib = CameraCalibration.load_from_xml_files_scaled(
                 intr_file, 
                 extr_file, 
+                optimal_intr_file,
                 intrinsic_scale=self.intrinsic_scale, 
                 translation_scale=self.translation_scale
             )
