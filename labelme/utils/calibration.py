@@ -314,20 +314,39 @@ class CameraCalibration:
         device = 'cpu'
         B = 1
         X, Y, Z = bev_x, bev_y, 2
-        worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3 x 3 
-        ref_T_global = np.linalg.inv(worldgrid2worldcoord)  # 3 x 3
+        worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 4 x 4 (homogeneous)
+        # Convert Tensor to numpy array to avoid type mismatch
+        if isinstance(worldgrid2worldcoord, torch.Tensor):
+            worldgrid2worldcoord = worldgrid2worldcoord.cpu().numpy()
+        
+        # worldgrid2worldcoord is 4x4, use it directly as 4x4
+        ref_T_global_4x4 = np.linalg.inv(worldgrid2worldcoord)  # 4 x 4
+        # Ensure ref_T_global is numpy array
+        ref_T_global_4x4 = np.asarray(ref_T_global_4x4, dtype=np.float32)
+        
         pix_T_cam = self._merge_intrinsics_4x4(self.optimal_intrinsic)
         
-        cam_T_global = np.eye(4, dtype=np.float32)
-        cam_T_global[:3] = self.extrinsic[:3]
+        # self.extrinsic is world-to-camera (4x4), so cam_T_global = self.extrinsic
+        # Ensure it's a proper 4x4 matrix
+        cam_T_global = np.asarray(self.extrinsic, dtype=np.float32).copy()
+        if cam_T_global.shape != (4, 4):
+            raise ValueError(f"extrinsic must be 4x4, got {cam_T_global.shape}")
+        # Ensure last row is [0, 0, 0, 1] for proper homogeneous transformation
+        cam_T_global[3, :] = [0, 0, 0, 1]
         
-        # Compute transformations
+        # Compute transformations - work with 4x4 matrices, then extract 3x3 for 2D homography
         global_T_cam = np.linalg.inv(cam_T_global)
-        ref_T_cam = ref_T_global @ global_T_cam
-        cam_T_ref = np.linalg.inv(ref_T_cam)
+        ref_T_cam_4x4 = ref_T_global_4x4 @ global_T_cam
+        # Ensure ref_T_cam is numpy array
+        ref_T_cam_4x4 = np.asarray(ref_T_cam_4x4, dtype=np.float32)
+        cam_T_ref_4x4 = np.linalg.inv(ref_T_cam_4x4)
         
-        # Key: Use the 3x3 projection (matching Document 2)
-        pix_T_ref = pix_T_cam[:3, :3] @ cam_T_ref[:3, [0, 1, 3]]
+        # Ensure cam_T_ref is numpy array (in case it's a Tensor)
+        cam_T_ref_4x4 = np.asarray(cam_T_ref_4x4, dtype=np.float32)
+        
+        # Key: Extract 3x3 from 4x4 for 2D homography: rows [0,1,3] and columns [0,1,3]
+        # This matches the original code: cam_T_ref[:3, [0, 1, 3]]
+        pix_T_ref = pix_T_cam[:3, :3] @ cam_T_ref_4x4[:3, [0, 1, 3]]
         # Project mem points
         points_3d[:, -1] = 1.0
         
@@ -509,6 +528,136 @@ class CameraCalibration:
         )
         
         return result
+    
+    def project_2d_to_mem(
+        self,
+        pixel_points: np.ndarray,
+        bev_x: int = 1200,
+        bev_y: int = 800,
+        bev_bounds: Optional[List] = None,
+        ground_z: float = 0.0,
+        apply_undistortion: bool = True,
+    ) -> Optional[np.ndarray]:
+        """
+        Project 2D image pixel coordinates to BEV memory coordinates.
+        
+        Inverse transformation chain:
+            distorted pixel -> undistorted pixel -> camera -> world (z=ground_z) 
+            -> ref (via worldgrid2worldcoord^-1) -> mem (via ref_T_mem^-1)
+        
+        Args:
+            pixel_points: Nx2 array of pixel coordinates in image
+            bev_x: BEV grid X dimension
+            bev_y: BEV grid Y dimension
+            bev_bounds: BEV bounds [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
+            ground_z: Height of ground plane in world coordinates (default 0.0)
+            apply_undistortion: Whether to apply undistortion (default True)
+            
+        Returns:
+            Nx2 array of memory coordinates, or None if projection fails
+        """
+        from labelme.utils.vox_utils import vox
+        from labelme.utils.constants import get_worldgrid2worldcoord_torch, DEFAULT_BEV_BOUNDS
+        import torch
+        
+        if pixel_points.shape[1] != 2:
+            raise ValueError(f"pixel_points must be Nx2, got {pixel_points.shape}")
+        
+        if bev_bounds is None:
+            bev_bounds = DEFAULT_BEV_BOUNDS
+        
+        n_points = pixel_points.shape[0]
+        pixel_points = np.asarray(pixel_points, dtype=np.float32)
+        
+        # Step 1: Undistort pixel coordinates if needed
+        if apply_undistortion:
+            # Undistort using optimal intrinsic
+            pixel_points_reshaped = pixel_points.reshape(-1, 1, 2)
+            undistorted = cv2.undistortPoints(
+                pixel_points_reshaped,
+                self.intrinsic,
+                self.distortion,
+                None,
+                self.optimal_intrinsic
+            )
+            pixel_points_normalized = undistorted.reshape(-1, 2)
+        else:
+            # Convert to normalized coordinates using optimal intrinsic
+            pixel_points_normalized = np.zeros_like(pixel_points)
+            pixel_points_normalized[:, 0] = (pixel_points[:, 0] - self.optimal_intrinsic[0, 2]) / self.optimal_intrinsic[0, 0]
+            pixel_points_normalized[:, 1] = (pixel_points[:, 1] - self.optimal_intrinsic[1, 2]) / self.optimal_intrinsic[1, 1]
+        
+        # Step 2: Transform directly from pixel to mem coordinates
+        # Use same transformation chain as project_3d_to_2d but in reverse
+        # In project_3d_to_2d: mem (x, y, 1) -> ref (via pix_T_ref) -> pixel
+        # So here: pixel -> ref (via pix_T_ref^-1) -> mem
+        
+        device = 'cpu'
+        worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 4 x 4 (homogeneous)
+        if isinstance(worldgrid2worldcoord, torch.Tensor):
+            worldgrid2worldcoord = worldgrid2worldcoord.cpu().numpy()
+        
+        # worldgrid2worldcoord is 4x4, use it directly as 4x4
+        ref_T_global_4x4 = np.linalg.inv(worldgrid2worldcoord)  # 4 x 4
+        ref_T_global_4x4 = np.asarray(ref_T_global_4x4, dtype=np.float32)
+        
+        pix_T_cam = self._merge_intrinsics_4x4(self.optimal_intrinsic)
+        
+        # self.extrinsic is world-to-camera (4x4), so cam_T_global = self.extrinsic
+        # Ensure it's a proper 4x4 matrix
+        cam_T_global = np.asarray(self.extrinsic, dtype=np.float32).copy()
+        if cam_T_global.shape != (4, 4):
+            raise ValueError(f"extrinsic must be 4x4, got {cam_T_global.shape}")
+        # Ensure last row is [0, 0, 0, 1] for proper homogeneous transformation
+        cam_T_global[3, :] = [0, 0, 0, 1]
+        
+        global_T_cam = np.linalg.inv(cam_T_global)
+        
+        ref_T_cam_4x4 = ref_T_global_4x4 @ global_T_cam
+        ref_T_cam_4x4 = np.asarray(ref_T_cam_4x4, dtype=np.float32)
+        cam_T_ref_4x4 = np.linalg.inv(ref_T_cam_4x4)
+        cam_T_ref_4x4 = np.asarray(cam_T_ref_4x4, dtype=np.float32)
+        
+        # Compute pix_T_ref (same as project_3d_to_2d)
+        # pix_T_ref: 3x3 matrix that transforms mem (x, y, 1) to pixel
+        # Extract 3x3 from 4x4: rows [0,1,3] and columns [0,1,3]
+        pix_T_ref = pix_T_cam[:3, :3] @ cam_T_ref_4x4[:3, [0, 1, 3]]  # 3x3
+        
+        # Ensure pix_T_ref is numpy array
+        pix_T_ref = np.asarray(pix_T_ref, dtype=np.float32)
+        if pix_T_ref.shape != (3, 3):
+            raise ValueError(f"pix_T_ref has unexpected shape: {pix_T_ref.shape}, expected (3, 3)")
+        
+        # Inverse: mem_T_pix = (pix_T_ref)^-1
+        # This transforms pixel back to mem coordinates
+        mem_T_pix = np.linalg.inv(pix_T_ref)  # 3x3
+        
+        # Transform pixel coordinates to mem coordinates
+        # Convert normalized pixel points to homogeneous coordinates (x, y, 1)
+        pixel_pts_homo = np.ones((n_points, 3), dtype=np.float32)
+        pixel_pts_homo[:, 0] = pixel_points_normalized[:, 0]
+        pixel_pts_homo[:, 1] = pixel_points_normalized[:, 1]
+        
+        # Apply transformation: mem = mem_T_pix @ pixel
+        mem_pts_homo = (mem_T_pix @ pixel_pts_homo.T).T  # N x 3
+        mem_points_result = mem_pts_homo[:, :2] / (mem_pts_homo[:, 2:3] + 1e-8)  # N x 2
+        
+        # Check validity: points should be finite
+        valid_mask = np.isfinite(mem_points_result).all(axis=1)
+        mem_points_result[~valid_mask] = np.nan
+        
+        # Clamp mem coordinates to BEV bounds to ensure they're within valid range
+        # This prevents points from being displayed incorrectly on BEV canvas
+        if bev_bounds is not None and len(bev_bounds) >= 4:
+            x_min, x_max = bev_bounds[0], bev_bounds[1]
+            y_min, y_max = bev_bounds[2], bev_bounds[3]
+            # Only clamp valid points
+            valid_indices = valid_mask
+            if np.any(valid_indices):
+                mem_points_result[valid_indices, 0] = np.clip(mem_points_result[valid_indices, 0], x_min, x_max)
+                mem_points_result[valid_indices, 1] = np.clip(mem_points_result[valid_indices, 1], y_min, y_max)
+        
+        return mem_points_result
 
     
     def project_3d_box_to_2d(
@@ -663,7 +812,12 @@ def generate_bev_from_cameras(
     B = 1
     X, Y, Z = bev_x, bev_y, 2
     worldgrid2worldcoord = get_worldgrid2worldcoord_torch(device)  # 3 x 3 
+    # Convert Tensor to numpy array to avoid type mismatch
+    if isinstance(worldgrid2worldcoord, torch.Tensor):
+        worldgrid2worldcoord = worldgrid2worldcoord.cpu().numpy()
     ref_T_global = np.linalg.inv(worldgrid2worldcoord)  # 3 x 3
+    # Ensure ref_T_global is numpy array
+    ref_T_global = np.asarray(ref_T_global, dtype=np.float32)
 
     for cam in camera_data:
         camera_id = cam.get("camera_id")
@@ -689,12 +843,21 @@ def generate_bev_from_cameras(
             # Compute transformation matrices (same as in project_3d_to_2d)
             pix_T_cam = calib._merge_intrinsics_4x4(calib.optimal_intrinsic)
             
-            cam_T_global = np.eye(4, dtype=np.float32)
-            cam_T_global[:3] = calib.extrinsic[:3]
+            # calib.extrinsic is world-to-camera (4x4), so cam_T_global = calib.extrinsic
+            # Ensure it's a proper 4x4 matrix
+            cam_T_global = np.asarray(calib.extrinsic, dtype=np.float32).copy()
+            if cam_T_global.shape != (4, 4):
+                raise ValueError(f"extrinsic must be 4x4, got {cam_T_global.shape}")
+            # Ensure last row is [0, 0, 0, 1] for proper homogeneous transformation
+            cam_T_global[3, :] = [0, 0, 0, 1]
             
             global_T_cam = np.linalg.inv(cam_T_global)
             ref_T_cam = ref_T_global @ global_T_cam
+            # Ensure ref_T_cam is numpy array
+            ref_T_cam = np.asarray(ref_T_cam, dtype=np.float32)
             cam_T_ref = np.linalg.inv(ref_T_cam)
+            # Ensure cam_T_ref is numpy array
+            cam_T_ref = np.asarray(cam_T_ref, dtype=np.float32)
             
             # 3x3 projection matrix from mem/ref to pixel coordinates
             pix_T_ref = pix_T_cam[:3, :3] @ cam_T_ref[:3, [0, 1, 3]]  # 3x3

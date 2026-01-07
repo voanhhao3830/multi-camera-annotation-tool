@@ -8,7 +8,8 @@ from .object_tracking import ObjectTracking
 class FixedIDTracker:
     """
     Offline tracker with fixed number of objects.
-    Uses Hungarian assignment on BEV centroids frame-to-frame to minimize ID switches.
+    Uses Hungarian assignment on BEV footpoints (representative points from clusters) frame-to-frame to minimize ID switches.
+    Note: Uses actual detection points (footpoints) from clusters, not computed centroids.
     """
 
     def __init__(self, list_of_labels: List[List[Tuple[float, float]]], expected_objects: int, max_distance: float):
@@ -86,20 +87,47 @@ class FixedIDTracker:
                     assigned_dets.add(c)
 
             # Unassigned tracks keep previous position
-            # Unassigned detections: assign to nearest available track with None pos
+            # Unassigned detections: assign to nearest available track
+            # First, try to find tracks with None pos that haven't been assigned in this frame
             for det_idx, det in enumerate(dets):
                 if det_idx in assigned_dets:
                     continue
-                # find a free track (pos None)
-                free_tid = None
+                
+                # Find the nearest unassigned track (even if it has a position from previous frame)
+                # This ensures all detections are assigned if possible
+                best_tid = None
+                min_dist = float('inf')
+                
+                # First, try tracks with None pos
                 for tid in range(self.expected_objects):
-                    if tid not in temporal_map.values() and self.track_states[tid]['pos'] is None:
-                        free_tid = tid
-                        break
-                if free_tid is not None:
-                    self.track_states[free_tid]['pos'] = det
-                    temporal_map[(f_idx, det_idx)] = free_tid
-                # else drop this detection
+                    if tid not in [temporal_map.get((f_idx, c), -1) for c in assigned_dets]:
+                        tpos = self.track_states[tid]['pos']
+                        if tpos is None:
+                            # Found a free track
+                            best_tid = tid
+                            min_dist = 0
+                            break
+                
+                # If no free track, find the nearest track that hasn't been assigned in this frame
+                if best_tid is None:
+                    for tid in range(self.expected_objects):
+                        # Check if this track was already assigned in this frame
+                        already_assigned = any(temporal_map.get((f_idx, c), -1) == tid for c in assigned_dets)
+                        if not already_assigned:
+                            tpos = self.track_states[tid]['pos']
+                            if tpos is not None:
+                                dx = tpos[0] - det[0]
+                                dy = tpos[1] - det[1]
+                                dist = np.sqrt(dx * dx + dy * dy)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_tid = tid
+                
+                # Assign to best track if found and within max_distance
+                if best_tid is not None and min_dist <= self.max_distance * 2:  # Allow larger distance for unassigned detections
+                    self.track_states[best_tid]['pos'] = det
+                    temporal_map[(f_idx, det_idx)] = best_tid
+                # else drop this detection (should rarely happen)
 
         return temporal_map
 
@@ -189,16 +217,30 @@ class PreprocessLabel:
         
         # Get number of frames from first camera
         camera_names = list(multi_camera_detections.keys())
+        if not camera_names:
+            return {}
+        
         num_frames = len(multi_camera_detections[camera_names[0]])
         
         # Verify all cameras have the same number of frames
+        # If any camera has fewer frames, pad with empty lists
+        # If any camera has more frames, trim to num_frames
         for cam_name in camera_names:
             cam_frames = len(multi_camera_detections[cam_name])
-            if cam_frames != num_frames:
+            if cam_frames < num_frames:
+                print(f"WARNING: Camera {cam_name} has {cam_frames} frames, padding to {num_frames}")
+                # Pad with empty detection lists
+                while len(multi_camera_detections[cam_name]) < num_frames:
+                    multi_camera_detections[cam_name].append([])
+            elif cam_frames > num_frames:
+                print(f"WARNING: Camera {cam_name} has {cam_frames} frames, trimming to {num_frames}")
+                # Trim to num_frames
+                multi_camera_detections[cam_name] = multi_camera_detections[cam_name][:num_frames]
+            elif cam_frames != num_frames:
                 print(f"WARNING: Camera {cam_name} has {cam_frames} frames, expected {num_frames}")
         
         print(f"Processing {len(camera_names)} cameras: {camera_names}")
-        print(f"Total frames: {num_frames}")
+        print(f"Total frames: {num_frames} (will process frames 0 to {num_frames-1})")
         
         # Step 1: Multiview matching for each frame
         # frame_multiview_map: {frame_idx: {(camera_name, local_id): frame_global_id}}
@@ -207,14 +249,19 @@ class PreprocessLabel:
         frame_bev_coords = {}
         
         print(f"Step 1: Multiview matching for {num_frames} frames...")
+        print(f"  Will process frames: {list(range(num_frames))}")
         prev_smoothed_centroids = None  # Track smoothed centroids for next frame
         
         for frame_idx in range(num_frames):
+            if frame_idx == num_frames - 1:
+                print(f"  Processing last frame: {frame_idx}")
             # Get detections for this frame - ensure ALL cameras are included
             frame_detections = {}
+            total_detections_in_frame = 0
             for camera_name in camera_names:
                 if frame_idx < len(multi_camera_detections[camera_name]):
                     frame_detections[camera_name] = multi_camera_detections[camera_name][frame_idx]
+                    total_detections_in_frame += len(frame_detections[camera_name])
                 else:
                     frame_detections[camera_name] = []
             
@@ -226,6 +273,14 @@ class PreprocessLabel:
                 for cam_name in missing_cams:
                     frame_detections[cam_name] = []
             
+            # Debug: Log detections per camera for first frame
+            if frame_idx == 0:
+                print(f"  Frame {frame_idx} detections per camera:")
+                for cam_name in camera_names:
+                    num_dets = len(frame_detections.get(cam_name, []))
+                    print(f"    {cam_name}: {num_dets} detections")
+                print(f"  Total detections in frame: {total_detections_in_frame}")
+            
             # Match multiview for this frame with warm start from previous frame
             multiview_map = self.multiview_matcher.match_multiview(
                 frame_detections,
@@ -234,31 +289,63 @@ class PreprocessLabel:
             )
             frame_multiview_maps[frame_idx] = multiview_map
             
-            # Collect BEV coordinates for each frame_global_id (centroid of cluster)
+            # Debug: Log multiview matching results for first frame
+            if frame_idx == 0:
+                print(f"  Frame {frame_idx} multiview matching results:")
+                # Count detections per global_id
+                global_id_counts = {}
+                for (cam_name, local_id), global_id in multiview_map.items():
+                    if global_id not in global_id_counts:
+                        global_id_counts[global_id] = []
+                    global_id_counts[global_id].append((cam_name, local_id))
+                print(f"    Found {len(global_id_counts)} clusters:")
+                for global_id in sorted(global_id_counts.keys()):
+                    members = global_id_counts[global_id]
+                    print(f"      Cluster {global_id}: {len(members)} detections from cameras {[m[0] for m in members]}")
+            
+            # Collect BEV coordinates for each frame_global_id (representative footpoint from cluster)
             frame_global_id_coords = {}  # {frame_global_id: (x, y)}
             
-            # Group by frame_global_id to compute centroids
-            frame_global_id_points = {}  # {frame_global_id: [(x, y), ...]}
+            # IMPORTANT: Use representative footpoint from multiview_matcher instead of computing centroid
+            # The footpoint is selected as the point closest to the cluster centroid (one actual detection point)
+            current_frame_centroids = {}  # {frame_global_id: np.array([x, y])} - stores footpoint, not centroid
             
-            for (camera_name, local_id), frame_global_id in multiview_map.items():
-                bev_coord = self.multiview_matcher.get_bev_coords(camera_name, local_id)
-                if bev_coord is not None:
-                    x, y = bev_coord
+            # Get representative footpoints from multiview_matcher (computed in _cluster_multiview_detections)
+            for frame_global_id in set(multiview_map.values()):
+                footpoint = self.multiview_matcher.get_cluster_centroid(frame_global_id)
+                if footpoint is not None:
+                    x, y = footpoint
                     if np.isfinite(x) and np.isfinite(y):
-                        if frame_global_id not in frame_global_id_points:
-                            frame_global_id_points[frame_global_id] = []
-                        frame_global_id_points[frame_global_id].append((x, y))
-            
-            # Compute centroids for each frame_global_id
-            current_frame_centroids = {}  # {frame_global_id: np.array([x, y])}
-            for frame_global_id, points in frame_global_id_points.items():
-                if points:
-                    points_array = np.array(points)
-                    centroid = np.mean(points_array, axis=0)
-                    current_frame_centroids[frame_global_id] = centroid
-                    # Round centroid to ensure consistency (~1 cm precision)
-                    centroid_rounded = (round(float(centroid[0]), 2), round(float(centroid[1]), 2))
-                    frame_global_id_coords[frame_global_id] = centroid_rounded
+                        current_frame_centroids[frame_global_id] = np.array([x, y])
+                        # Round footpoint to ensure consistency (~1 cm precision)
+                        footpoint_rounded = (round(float(x), 2), round(float(y), 2))
+                        frame_global_id_coords[frame_global_id] = footpoint_rounded
+                        
+                        # Debug: Print footpoint for first frame
+                        if frame_idx == 0:
+                            # Count points in this cluster for debug info
+                            cluster_points_count = sum(1 for fgid in multiview_map.values() if fgid == frame_global_id)
+                            print(f"  Frame {frame_idx}, cluster {frame_global_id}: footpoint = ({footpoint_rounded[0]:.2f}, {footpoint_rounded[1]:.2f}) from {cluster_points_count} detections")
+                else:
+                    # Fallback: select first point from cluster if footpoint not available
+                    # This should rarely happen, but provides a safety net
+                    frame_global_id_points = []
+                    for (camera_name, local_id), fgid in multiview_map.items():
+                        if fgid == frame_global_id:
+                            bev_coord = self.multiview_matcher.get_bev_coords(camera_name, local_id)
+                            if bev_coord is not None:
+                                x, y = bev_coord
+                                if np.isfinite(x) and np.isfinite(y):
+                                    frame_global_id_points.append((x, y))
+                    
+                    if frame_global_id_points:
+                        # Use first point as representative footpoint
+                        footpoint = frame_global_id_points[0]
+                        current_frame_centroids[frame_global_id] = np.array(footpoint)
+                        footpoint_rounded = (round(float(footpoint[0]), 2), round(float(footpoint[1]), 2))
+                        frame_global_id_coords[frame_global_id] = footpoint_rounded
+                        if frame_idx == 0:
+                            print(f"  Frame {frame_idx}, cluster {frame_global_id}: fallback footpoint = ({footpoint_rounded[0]:.2f}, {footpoint_rounded[1]:.2f}) from {len(frame_global_id_points)} points")
             
             # Apply smoothing with previous centroids for better stability
             # Note: smoothing is only applied after merge and remap IDs to ensure consistency
@@ -273,6 +360,9 @@ class PreprocessLabel:
             # If there are fewer than n_clusters clusters, make sure cluster IDs are still numbered from 0 to n_clusters-1.
             if self.n_clusters is not None:
                 num_current_clusters = len(frame_global_id_coords)
+                
+                if frame_idx == 0:
+                    print(f"  Frame {frame_idx}: n_clusters={self.n_clusters}, num_current_clusters={num_current_clusters}")
                 
                 # KMeans always creates exactly n_clusters clusters, but after centroid rounding
                 # we may end up with fewer due to duplicates (or more in edge cases).
@@ -606,15 +696,53 @@ class PreprocessLabel:
         if not hasattr(self, 'frame_global_id_to_idx') or not hasattr(self, 'temporal_global_id_map'):
             return result
         
+        # Iterate through all frames and map frame_global_id centroids to final_global_id
         for frame_idx in range(len(self.frame_bev_coords)):
             frame_bev = self.frame_bev_coords.get(frame_idx, {})
+            if not frame_bev:
+                continue
+                
             frame_id_to_idx = self.frame_global_id_to_idx[frame_idx] if frame_idx < len(self.frame_global_id_to_idx) else {}
             
+            # Debug logging for first few frames
+            if frame_idx < 3:
+                print(f"  get_centroids_by_final_id: Frame {frame_idx}")
+                print(f"    frame_bev keys (frame_global_ids): {sorted(frame_bev.keys())}")
+                print(f"    frame_id_to_idx: {frame_id_to_idx}")
+            
+            # Map each frame_global_id centroid to its final_global_id
             for frame_global_id, centroid in frame_bev.items():
                 obj_idx = frame_id_to_idx.get(frame_global_id)
                 if obj_idx is not None:
                     final_global_id = self.temporal_global_id_map.get((frame_idx, obj_idx))
                     if final_global_id is not None:
-                        result[(frame_idx, final_global_id)] = centroid
+                        # Store centroid for this final_global_id
+                        # If multiple frame_global_ids map to same final_global_id (shouldn't happen),
+                        # use the first one (they should all be the same after clustering)
+                        key = (frame_idx, final_global_id)
+                        if key not in result:
+                            result[key] = centroid
+                            
+                            # Debug logging for first few frames
+                            if frame_idx < 3:
+                                print(f"    Mapped: frame_global_id={frame_global_id} -> obj_idx={obj_idx} -> final_global_id={final_global_id}, centroid={centroid}")
+                    else:
+                        # Fallback: use frame_global_id as final_global_id if temporal mapping not found
+                        # This can happen if the detection was not tracked (e.g., too far from previous position)
+                        final_global_id = frame_global_id
+                        key = (frame_idx, final_global_id)
+                        if key not in result:
+                            result[key] = centroid
+                        if frame_idx < 3:
+                            print(f"    WARNING: frame_global_id={frame_global_id} -> obj_idx={obj_idx}, but no temporal mapping. Using frame_global_id={frame_global_id} as final_global_id")
+                else:
+                    # Fallback: use frame_global_id directly if not in frame_id_to_idx
+                    # This should rarely happen, but provides a safety net
+                    final_global_id = frame_global_id
+                    key = (frame_idx, final_global_id)
+                    if key not in result:
+                        result[key] = centroid
+                    if frame_idx < 3:
+                        print(f"    WARNING: frame_global_id={frame_global_id} not found in frame_id_to_idx. Using frame_global_id={frame_global_id} as final_global_id")
         
         return result

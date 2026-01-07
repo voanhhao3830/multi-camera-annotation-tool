@@ -106,16 +106,17 @@ def run_yolo_detection(
                     results = yolo_model(image, verbose=False, conf=conf_threshold)
                     
                     # Extract detections
+                    # IMPORTANT: Keep bounding boxes as floats to preserve YOLO precision
                     detections = []
                     for result in results:
                         boxes = result.boxes
                         for box in boxes:
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                             detections.append({
-                                "xmin": int(x1),
-                                "ymin": int(y1),
-                                "xmax": int(x2),
-                                "ymax": int(y2),
+                                "xmin": float(x1),  # Keep as float to preserve YOLO precision
+                                "ymin": float(y1),  # Keep as float to preserve YOLO precision
+                                "xmax": float(x2),  # Keep as float to preserve YOLO precision
+                                "ymax": float(y2),  # Keep as float to preserve YOLO precision
                                 "confidence": float(box.conf[0].cpu().numpy()),
                                 "class": int(box.cls[0].cpu().numpy())
                             })
@@ -278,16 +279,17 @@ def run_yolo_detection_return_dict(
                     results = yolo_model(image, verbose=False, conf=conf_threshold)
                     
                     # Extract detections - EXACT same as run_yolo_detection
+                    # IMPORTANT: Keep bounding boxes as floats to preserve YOLO precision
                     detections = []
                     for result in results:
                         boxes = result.boxes
                         for box in boxes:
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                             detections.append({
-                                "xmin": int(x1),
-                                "ymin": int(y1),
-                                "xmax": int(x2),
-                                "ymax": int(y2),
+                                "xmin": float(x1),  # Keep as float to preserve YOLO precision
+                                "ymin": float(y1),  # Keep as float to preserve YOLO precision
+                                "xmax": float(x2),  # Keep as float to preserve YOLO precision
+                                "ymax": float(y2),  # Keep as float to preserve YOLO precision
                                 "confidence": float(box.conf[0].cpu().numpy()),
                                 "class": int(box.cls[0].cpu().numpy())
                             })

@@ -58,6 +58,7 @@ class MultiCameraTracking:
         self.global_id_map = {}  # {(camera_name, local_id): global_id}
         self.local_id_map = {}   # {(camera_name, global_id): local_id}
         self.bev_coords = {}     # {(camera_name, local_id): (x, y)}
+        self.cluster_centroids = {}  # {cluster_id: (x, y)} - KMeans centroids for each cluster
         
     def load_model(self):
         """Load detection model"""
@@ -195,16 +196,69 @@ class MultiCameraTracking:
             if not assigned:
                 unassigned.append(idx)
 
-        # For unassigned detections, create new cluster (singleton) to maintain camera constraint
-        next_cluster_id = n_clusters
+        # For unassigned detections: try to assign to existing clusters
+        # CRITICAL: If n_clusters is set, we must NOT create new clusters beyond n_clusters
+        # Instead, try to assign unassigned detections to existing clusters that have space
         for idx in unassigned:
             cam_name, _ = coord_to_camera[idx]
-            clusters[next_cluster_id] = [idx]
-            cluster_cameras[next_cluster_id] = {cam_name}
-            next_cluster_id += 1
+            assigned = False
+            # Try to find a cluster that:
+            # 1. Has space (not at size_limit)
+            # 2. Doesn't already have this camera
+            # 3. Is closest to this detection
+            best_cluster = None
+            min_dist = float('inf')
+            for c in range(n_clusters):
+                if len(clusters[c]) >= size_limit:
+                    continue
+                if cam_name in cluster_cameras[c]:
+                    continue
+                # Check distance to cluster centroid
+                if len(clusters[c]) > 0:
+                    # Use centroid of existing points in cluster
+                    cluster_points = [all_coords[i] for i in clusters[c]]
+                    cluster_center = np.mean(np.array(cluster_points), axis=0)
+                    detection_point = coords_array[idx]
+                    dist_to_cluster = np.linalg.norm(detection_point - cluster_center)
+                    if dist_to_cluster < min_dist:
+                        min_dist = dist_to_cluster
+                        best_cluster = c
+                else:
+                    # Empty cluster, use centroid from KMeans
+                    if c < len(centroids):
+                        detection_point = coords_array[idx]
+                        dist_to_cluster = np.linalg.norm(detection_point - centroids[c])
+                        if dist_to_cluster < min_dist:
+                            min_dist = dist_to_cluster
+                            best_cluster = c
+            
+            # Assign to best cluster if found
+            if best_cluster is not None:
+                clusters[best_cluster].append(idx)
+                cluster_cameras[best_cluster].add(cam_name)
+                assigned = True
+            # If still not assigned and n_clusters is set, we must drop this detection
+            # to maintain the fixed number of clusters
+            if not assigned:
+                if self.n_clusters is not None:
+                    # Drop this detection to maintain n_clusters constraint
+                    print(f"    WARNING: Dropping unassigned detection from {cam_name} to maintain n_clusters={self.n_clusters}")
+                else:
+                    # If n_clusters is None, create new cluster (original behavior)
+                    next_cluster_id = len(clusters)
+                    clusters[next_cluster_id] = [idx]
+                    cluster_cameras[next_cluster_id] = {cam_name}
+                    # Use the detection point itself as representative footpoint
+                    detection_point = coords_array[idx]
+                    self.cluster_centroids[next_cluster_id] = (float(detection_point[0]), float(detection_point[1]))
 
         # Build final result: {cluster_id: [(camera_name, local_id), ...]}
         result: Dict[int, List[Tuple[str, int]]] = {}
+        # Store centroids for each cluster (will be computed from actual assigned points)
+        # Initialize with any existing centroids (e.g., from new clusters created above)
+        cluster_centroids_temp = self.cluster_centroids.copy() if hasattr(self, 'cluster_centroids') else {}
+        self.cluster_centroids = {}
+        
         for cid, point_indices in clusters.items():
             if not point_indices:
                 continue
@@ -213,6 +267,25 @@ class MultiCameraTracking:
                 cam_name, det_idx = coord_to_camera[idx]
                 members.append((cam_name, det_idx))
             result[cid] = members
+            
+            # Instead of computing centroid, select a representative footpoint from the cluster
+            # Choose the point closest to the cluster centroid (mean of all points)
+            cluster_points = [all_coords[i] for i in point_indices]
+            if cluster_points:
+                points_array = np.array(cluster_points, dtype=np.float32)
+                # Compute centroid first to find the representative point
+                actual_centroid = np.mean(points_array, axis=0)
+                
+                # Find the point closest to centroid (most representative footpoint)
+                distances = np.linalg.norm(points_array - actual_centroid, axis=1)
+                closest_idx = np.argmin(distances)
+                representative_point = points_array[closest_idx]
+                
+                # Store the representative footpoint instead of centroid
+                self.cluster_centroids[cid] = (float(representative_point[0]), float(representative_point[1]))
+            elif cid in cluster_centroids_temp:
+                # Use existing point if cluster has no points (shouldn't happen, but safety)
+                self.cluster_centroids[cid] = cluster_centroids_temp[cid]
 
         return result
 
@@ -238,6 +311,7 @@ class MultiCameraTracking:
         self.global_id_map = {}
         self.local_id_map = {}
         self.bev_coords = {}
+        self.cluster_centroids = {}
         
         # Project to BEV
         bev_results = self.project_bev(detections)
@@ -264,8 +338,30 @@ class MultiCameraTracking:
         
         # Cluster BEV coordinates
         if bev_coords_list:
+            # Debug: Log BEV coordinates before clustering
+            if len(bev_coords_list) > 0 and len(bev_coords_list) <= 20:  # Only log for small number of detections
+                print(f"    Clustering {len(bev_coords_list)} BEV coordinates from {len(detections)} cameras")
+                cam_counts = {}
+                for x, y, cam_name, local_id in bev_coords_list:
+                    if cam_name not in cam_counts:
+                        cam_counts[cam_name] = 0
+                    cam_counts[cam_name] += 1
+                print(f"      BEV coords per camera: {cam_counts}")
+            
             clusters = self._cluster_multiview_detections(bev_coords_list, prev_centroids, max_centroid_movement)
+            
+            # Debug: Log clustering results
+            if len(clusters) > 0:
+                print(f"    Clustering created {len(clusters)} clusters")
+                for cluster_id in sorted(clusters.keys()):
+                    members = clusters[cluster_id]
+                    if members:
+                        cams_in_cluster = [cam for cam, _ in members]
+                        print(f"      Cluster {cluster_id}: {len(members)} detections from {len(set(cams_in_cluster))} cameras: {set(cams_in_cluster)}")
+            
             next_global_id = 0
+            # Map cluster_id to global_id for centroid lookup
+            cluster_to_global_id = {}  # {cluster_id: global_id}
 
             # Assign consecutive global_id to each cluster
             for cluster_id in sorted(clusters.keys()):
@@ -274,11 +370,23 @@ class MultiCameraTracking:
                     continue
                 global_id = next_global_id
                 next_global_id += 1
+                cluster_to_global_id[cluster_id] = global_id
                 for camera_name, local_id in members:
                     self.global_id_map[(camera_name, local_id)] = global_id
                     self.local_id_map[(camera_name, global_id)] = local_id
+            
+            # Map cluster representative footpoints from cluster_id to global_id
+            # This ensures we can look up footpoints by global_id later
+            global_id_footpoints = {}  # {global_id: (x, y)}
+            for cluster_id, footpoint in self.cluster_centroids.items():
+                if cluster_id in cluster_to_global_id:
+                    global_id = cluster_to_global_id[cluster_id]
+                    global_id_footpoints[global_id] = footpoint
+            # Replace cluster_centroids with global_id_footpoints (keeping same variable name for compatibility)
+            self.cluster_centroids = global_id_footpoints
         else:
             next_global_id = 0
+            print(f"    WARNING: No valid BEV coordinates to cluster!")
         
         # Assign separate IDs to invalid detections (those with failed BEV projection)
         # Each invalid detection gets its own unique ID after reserved cluster IDs
@@ -306,40 +414,29 @@ class MultiCameraTracking:
     
     def get_cluster_centroids(self) -> Optional[np.ndarray]:
         """
-        Get current frame's cluster centroids after clustering.
-        Returns centroids as numpy array of shape [n_clusters, 2] or None if not available.
+        Get current frame's cluster representative footpoints after clustering.
+        Returns footpoints as numpy array of shape [n_clusters, 2] or None if not available.
+        Uses stored representative footpoints (one per cluster, closest to centroid).
         """
-        if not self.global_id_map:
+        if not self.cluster_centroids:
             return None
         
-        # Group BEV coordinates by global_id
-        global_id_points = {}  # {global_id: [(x, y), ...]}
-        for (camera_name, local_id), global_id in self.global_id_map.items():
-            bev_coord = self.get_bev_coords(camera_name, local_id)
-            if bev_coord is not None:
-                x, y = bev_coord
-                if np.isfinite(x) and np.isfinite(y):
-                    if global_id not in global_id_points:
-                        global_id_points[global_id] = []
-                    global_id_points[global_id].append((x, y))
+        # Get footpoints sorted by cluster ID
+        sorted_ids = sorted(self.cluster_centroids.keys())
+        footpoints = [self.cluster_centroids[cid] for cid in sorted_ids]
         
-        if not global_id_points:
+        if not footpoints:
             return None
         
-        # Compute centroids for each global_id
-        centroids = []
-        sorted_ids = sorted(global_id_points.keys())
-        for global_id in sorted_ids:
-            points = global_id_points[global_id]
-            if points:
-                points_array = np.array(points)
-                centroid = np.mean(points_array, axis=0)
-                centroids.append(centroid)
-        
-        if not centroids:
-            return None
-        
-        return np.array(centroids, dtype=np.float32)
+        return np.array(footpoints, dtype=np.float32)
+    
+    def get_cluster_centroid(self, cluster_id: int) -> Optional[Tuple[float, float]]:
+        """
+        Get representative footpoint for a specific cluster ID.
+        Returns (x, y) or None if cluster not found.
+        Note: Despite the name, this returns a footpoint (not centroid) - one point from the cluster.
+        """
+        return self.cluster_centroids.get(cluster_id)
     
     def map_to_local_ids(self, camera_name: str, global_ids: List[int]) -> Dict[int, int]:
         """

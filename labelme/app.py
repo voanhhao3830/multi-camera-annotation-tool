@@ -2290,22 +2290,61 @@ class MainWindow(QtWidgets.QMainWindow):
             # Track which personIDs have already had points added to BEV to avoid duplicates
             # Since multiple person entries (one per camera) can have the same personID,
             # we only want to add one BEV point per personID (the centroid)
-            person_ids_with_bev_points = set()
+            # IMPORTANT: Group by personID first to ensure we only use one centroid per personID
+            person_id_to_data = {}  # {person_id: {ground_points, box_3d, locked, ...}}
+            
+            # First pass: collect data for each unique personID
+            total_persons = len(annotations)
+            persons_with_ground_points = 0
+            persons_without_ground_points = 0
             
             for person in annotations:
                 person_id = person.get("personID")
-                # Prioritize 'ground_points' (grid coordinates) over 'coordinates' (world coordinates)
-                ground_points = person.get("ground_points")
-                views = person.get("views", [])
-                box_3d = person.get("box_3d")  # Load 3D box metadata if available
-                locked = person.get("locked", False)  # Load locked state
-                
                 if person_id is None:
                     continue
                 
-                # Track if point was added to BEV (point is required for centroid)
-                # Skip if we already added a point for this personID (avoid duplicates)
-                point_added_to_bev = (person_id in person_ids_with_bev_points)
+                # Prioritize 'ground_points' (grid coordinates) - these should be centroids after preprocessing
+                ground_points = person.get("ground_points")
+                box_3d = person.get("box_3d")
+                locked = person.get("locked", False)
+                
+                # Debug: count persons with/without ground_points
+                if ground_points and len(ground_points) >= 2:
+                    persons_with_ground_points += 1
+                else:
+                    persons_without_ground_points += 1
+                
+                # For each personID, keep the first entry with valid ground_points or box_3d
+                # This ensures we use the centroid (from preprocessing) rather than individual detection points
+                if person_id not in person_id_to_data:
+                    person_id_to_data[person_id] = {
+                        'ground_points': ground_points,
+                        'box_3d': box_3d,
+                        'locked': locked
+                    }
+                else:
+                    # If current entry has ground_points but stored one doesn't, use current
+                    if ground_points and len(ground_points) >= 2 and not person_id_to_data[person_id].get('ground_points'):
+                        person_id_to_data[person_id]['ground_points'] = ground_points
+                    # If current entry has box_3d but stored one doesn't, use current
+                    if box_3d and not person_id_to_data[person_id].get('box_3d'):
+                        person_id_to_data[person_id]['box_3d'] = box_3d
+                    # Update locked state (use True if any entry is locked)
+                    if locked:
+                        person_id_to_data[person_id]['locked'] = True
+            
+            # Debug log
+            if total_persons > 0:
+                logger.info(f"Loading frame {frame_index}: {total_persons} person entries, {persons_with_ground_points} with ground_points, {persons_without_ground_points} without ground_points")
+                logger.info(f"Unique personIDs: {len(person_id_to_data)}")
+            
+            # Second pass: add BEV points (centroids) - one per personID
+            person_ids_with_bev_points = set()  # Track which personIDs have BEV points added
+            for person_id, data in person_id_to_data.items():
+                ground_points = data.get('ground_points')
+                box_3d = data.get('box_3d')
+                locked = data.get('locked', False)
+                point_added_to_bev = False
                 
                 # Add 3D box on BEV if box_3d metadata is available
                 if self.bev_canvas and box_3d:
@@ -2354,26 +2393,47 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.bev_canvas and not point_added_to_bev:
                     if ground_points and len(ground_points) >= 2:
                         # ground_points are world grid coordinates (grid_x, grid_y)
-                        grid_x = ground_points[0]
-                        grid_y = ground_points[1]
-                        # Check if ground_points are valid (positive values)
-                        if grid_x >= 0 and grid_y >= 0:
-                            # Transform to memory coordinates for BEV display
-                            mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
-                            # Add point to BEV canvas (not a box)
-                            # Only add if we haven't added a point for this personID yet
-                            if not point_added_to_bev:
-                                self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
-                                # Restore locked state if available (don't emit signal during load)
-                                if locked:
-                                    self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
-                                person_ids_with_bev_points.add(person_id)
-                                point_added_to_bev = True
+                        try:
+                            grid_x = float(ground_points[0])
+                            grid_y = float(ground_points[1])
+                            # Check if ground_points are valid (positive values and not default center)
+                            # Default center is usually around (400, 320) or (bev_x/2, bev_y/2)
+                            default_x = self._bev_x / 2.0 if hasattr(self, '_bev_x') else 600.0
+                            default_y = self._bev_y / 2.0 if hasattr(self, '_bev_y') else 400.0
+                            
+                            # Check if coordinates are valid and not default center
+                            if grid_x >= 0 and grid_y >= 0:
+                                # Check if not too close to default center (within 10 pixels)
+                                dist_from_default = ((grid_x - default_x)**2 + (grid_y - default_y)**2)**0.5
+                                if dist_from_default > 10.0:  # Not default center
+                                    # Transform to memory coordinates for BEV display
+                                    mem_x, mem_y = self._worldgrid_to_mem(grid_x, grid_y)
+                                    # Add point to BEV canvas (not a box)
+                                    if not point_added_to_bev:
+                                        self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
+                                        # Restore locked state if available (don't emit signal during load)
+                                        if locked:
+                                            self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                        person_ids_with_bev_points.add(person_id)
+                                        point_added_to_bev = True
+                                        logger.debug(f"Added BEV point for person {person_id} from ground_points: ({grid_x:.2f}, {grid_y:.2f})")
+                                else:
+                                    logger.debug(f"Skipping default center point for person {person_id}: ({grid_x:.2f}, {grid_y:.2f})")
+                        except (ValueError, TypeError, IndexError) as e:
+                            logger.debug(f"Invalid ground_points for person {person_id}: {ground_points}, error: {e}")
                     
                     # If still no point added, try to compute from views or use default position
+                    # Note: We need to collect all views from all person entries with this personID
+                    # (since each person entry represents one camera view)
+                    all_views_for_person = []
+                    for person in annotations:
+                        if person.get("personID") == person_id:
+                            person_views = person.get("views", [])
+                            all_views_for_person.extend(person_views)
+                    
                     if not point_added_to_bev:
                         # Try to compute BEV position from first valid view
-                        for view in views:
+                        for view in all_views_for_person:
                             view_num = view.get("viewNum", -1)
                             xmin = view.get("xmin", -1)
                             ymin = view.get("ymin", -1)
@@ -2447,7 +2507,17 @@ class MainWindow(QtWidgets.QMainWindow):
                                     self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
                                 person_ids_with_bev_points.add(person_id)
                                 logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
-                        
+            
+            # Third pass: Add bounding boxes to camera views for all person entries
+            # (We need to iterate through all annotations to get all views)
+            for person in annotations:
+                person_id = person.get("personID")
+                if person_id is None:
+                    continue
+                
+                views = person.get("views", [])
+                locked = person.get("locked", False)
+                
                 # Add bounding boxes to camera views
                 for view in views:
                     view_num = view.get("viewNum", -1)
@@ -2898,8 +2968,10 @@ class MainWindow(QtWidgets.QMainWindow):
             temp_calib_folder = tempfile.mkdtemp(prefix="multicam_calib_")
             intrinsic_folder = os.path.join(temp_calib_folder, "intrinsic")
             extrinsic_folder = os.path.join(temp_calib_folder, "extrinsic")
+            optimal_intrinsic_folder = os.path.join(temp_calib_folder, "intrinsic_optimal")
             os.makedirs(intrinsic_folder, exist_ok=True)
             os.makedirs(extrinsic_folder, exist_ok=True)
+            os.makedirs(optimal_intrinsic_folder, exist_ok=True)
             
             # Copy calibration files for all cameras
             # Try both "Camera{number}" and "{number}" formats
@@ -2939,6 +3011,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     logger.warning(f"Intrinsic or extrinsic folder not found for {cam_name}")
                     continue
                 
+                # Find optimal intrinsic subfolder (for intrinsic_optimal folder)
+                optimal_intrinsic_subfolder = None
+                for subfolder_name in ["intrinsic_optimal", "intrinsic_original", "intrinsic"]:
+                    test_path = os.path.join(cam_root, subfolder_name)
+                    if os.path.exists(test_path):
+                        optimal_intrinsic_subfolder = test_path
+                        break
+                
                 # Try to find calibration files - could be intr_{cam_name}.xml or intr_{used_calib_name}.xml
                 intrinsic_files = glob.glob(os.path.join(intrinsic_subfolder, f"intr_{cam_name}.xml"))
                 extrinsic_files = glob.glob(os.path.join(extrinsic_subfolder, f"extr_{cam_name}.xml"))
@@ -2960,14 +3040,35 @@ class MainWindow(QtWidgets.QMainWindow):
                         logger.warning(f"No calibration files found for {cam_name} (tried {used_calib_name})")
                         continue
                 
+                # Find optimal intrinsic file (same patterns as intrinsic)
+                optimal_intrinsic_files = []
+                if optimal_intrinsic_subfolder:
+                    optimal_intrinsic_files = glob.glob(os.path.join(optimal_intrinsic_subfolder, f"intr_{cam_name}.xml"))
+                    if not optimal_intrinsic_files:
+                        optimal_intrinsic_files = glob.glob(os.path.join(optimal_intrinsic_subfolder, f"intr_{used_calib_name}.xml"))
+                    if not optimal_intrinsic_files:
+                        all_optimal = glob.glob(os.path.join(optimal_intrinsic_subfolder, "*.xml"))
+                        if all_optimal:
+                            optimal_intrinsic_files = [all_optimal[0]]
+                
                 # Copy to temp folder with camera_name (for consistency in processing)
                 dest_intr = os.path.join(intrinsic_folder, f"intr_{cam_name}.xml")
                 dest_extr = os.path.join(extrinsic_folder, f"extr_{cam_name}.xml")
                 try:
                     shutil.copy2(intrinsic_files[0], dest_intr)
                     shutil.copy2(extrinsic_files[0], dest_extr)
+                    
+                    # Copy optimal intrinsic if found, otherwise copy same as intrinsic
+                    if optimal_intrinsic_files:
+                        dest_optimal = os.path.join(optimal_intrinsic_folder, f"intr_{cam_name}.xml")
+                        shutil.copy2(optimal_intrinsic_files[0], dest_optimal)
+                    else:
+                        # Use intrinsic as optimal if optimal not found
+                        dest_optimal = os.path.join(optimal_intrinsic_folder, f"intr_{cam_name}.xml")
+                        shutil.copy2(intrinsic_files[0], dest_optimal)
+                    
                     cameras_with_calib.append(cam_name)
-                    logger.info(f"Copied calibration files for {cam_name}")
+                    logger.info(f"Copied calibration files for {cam_name} (intrinsic, extrinsic, optimal)")
                 except Exception as e:
                     logger.error(f"Failed to copy calibration files for {cam_name}: {e}")
             
@@ -3076,6 +3177,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             logger.info(f"VIEW_TO_CAMERA mapping: {VIEW_TO_CAMERA}")
             
+            # Initialize multi_camera_detections with ALL cameras and ensure correct structure
+            # CRITICAL: All cameras must be present with exactly frame_count frames
+            # This is exactly the same structure as test_preprocess_label.py
             multi_camera_detections = {cam: [] for cam in camera_names}
             annotation_to_local_id_map = {}  # Map from annotation to local_id: {(frame_idx, cam_name, person_idx, view_idx): local_id}
             
@@ -3084,6 +3188,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             for frame_idx in range(frame_count):
                 frame_data = all_annotations[frame_idx]
+                # Initialize frame_bboxes for ALL cameras (same as test_preprocess_label.py)
                 frame_bboxes = {cam: [] for cam in camera_names}
                 local_id_counters = {cam: 0 for cam in camera_names}  # Track local_id per camera
                 
@@ -3123,8 +3228,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     if any(len(bboxes) > 0 for bboxes in frame_bboxes.values()):
                         frames_with_detections += 1
                 
+                # Ensure ALL cameras are added to multi_camera_detections for this frame
+                # This is critical for multiview matching to work correctly
                 for cam_name in camera_names:
                     multi_camera_detections[cam_name].append(frame_bboxes.get(cam_name, []))
+            
+            # Verify structure: ensure all cameras have exactly frame_count frames
+            # IMPORTANT: Rebuild multi_camera_detections to ensure consistent camera order
+            ordered_multi_camera_detections = {}
+            for cam_name in camera_names:
+                if cam_name in multi_camera_detections:
+                    ordered_multi_camera_detections[cam_name] = multi_camera_detections[cam_name]
+                else:
+                    ordered_multi_camera_detections[cam_name] = []
+                # Ensure exactly frame_count frames
+                while len(ordered_multi_camera_detections[cam_name]) < frame_count:
+                    ordered_multi_camera_detections[cam_name].append([])
+                if len(ordered_multi_camera_detections[cam_name]) > frame_count:
+                    ordered_multi_camera_detections[cam_name] = ordered_multi_camera_detections[cam_name][:frame_count]
+            multi_camera_detections = ordered_multi_camera_detections
+            
+            # Log structure for debugging
+            logger.info(f"multi_camera_detections structure before preprocessing:")
+            for cam_name in camera_names:
+                logger.info(f"  {cam_name}: {len(multi_camera_detections.get(cam_name, []))} frames")
+                if len(multi_camera_detections.get(cam_name, [])) > 0:
+                    total_dets = sum(len(frame_bboxes) for frame_bboxes in multi_camera_detections[cam_name])
+                    logger.info(f"    Total detections: {total_dets}")
             
             # Check if we have any detections
             # If no detections and model path is provided, automatically run YOLO detection first
@@ -3163,6 +3293,31 @@ class MainWindow(QtWidgets.QMainWindow):
                             conf_threshold=conf_threshold,
                             progress_callback=update_progress
                         )
+                        
+                        # Ensure all cameras are in multi_camera_detections with correct number of frames
+                        # This is critical for multiview matching to work correctly
+                        # IMPORTANT: Ensure camera_names order matches the order in multi_camera_detections
+                        # Rebuild multi_camera_detections to ensure consistent camera order
+                        ordered_multi_camera_detections = {}
+                        for cam_name in camera_names:
+                            if cam_name in multi_camera_detections:
+                                ordered_multi_camera_detections[cam_name] = multi_camera_detections[cam_name]
+                            else:
+                                ordered_multi_camera_detections[cam_name] = []
+                            # Ensure each camera has exactly frame_count frames
+                            while len(ordered_multi_camera_detections[cam_name]) < frame_count:
+                                ordered_multi_camera_detections[cam_name].append([])
+                            # Trim if too many frames
+                            if len(ordered_multi_camera_detections[cam_name]) > frame_count:
+                                ordered_multi_camera_detections[cam_name] = ordered_multi_camera_detections[cam_name][:frame_count]
+                        multi_camera_detections = ordered_multi_camera_detections
+                        
+                        # Log structure for debugging
+                        logger.info(f"multi_camera_detections structure after YOLO:")
+                        for cam_name in camera_names:
+                            logger.info(f"  {cam_name}: {len(multi_camera_detections.get(cam_name, []))} frames")
+                            if len(multi_camera_detections.get(cam_name, [])) > 0:
+                                logger.info(f"    Frame 0: {len(multi_camera_detections[cam_name][0])} detections")
                         
                         # Calculate total_detections from multi_camera_detections
                         total_detections = 0
@@ -3310,41 +3465,27 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Set image sizes for accurate projection (load from actual images)
             # This ensures BBoxToBEVConverter uses correct image dimensions instead of estimating
+            # CRITICAL: Image sizes must be set for ALL cameras before calling preprocess()
+            # This is exactly the same logic as test_preprocess_label.py
             import cv2
-            import re
             for cam_name in camera_names:
-                # Extract camera number from camera_name (e.g., "Camera1" -> "1")
-                match = re.search(r'(\d+)', cam_name)
-                if not match:
-                    logger.warning(f"Could not extract number from camera name: {cam_name}")
-                    continue
-                
-                cam_number = match.group(1)
-                # Find the corresponding camera folder
-                cam_folder = None
-                for folder in camera_folders:
-                    if folder == cam_number:
-                        cam_folder = folder
-                        break
-                
-                if cam_folder is None:
-                    logger.warning(f"Could not find folder for camera: {cam_name}")
-                    continue
-                
-                # Get image path for this camera
-                cam_path = os.path.join(image_subsets_folder, cam_folder)
+                # Find camera folder from camera name (Camera3 -> "3")
+                cam_num = cam_name.replace("Camera", "")
+                cam_path = os.path.join(image_subsets_folder, cam_num)
                 if os.path.isdir(cam_path):
-                    image_files = sorted(glob.glob(os.path.join(cam_path, "*.jpg")) + 
-                                       glob.glob(os.path.join(cam_path, "*.png")) + 
-                                       glob.glob(os.path.join(cam_path, "*.jpeg")))
+                    image_files = sorted(
+                        glob.glob(os.path.join(cam_path, "*.jpg")) + 
+                        glob.glob(os.path.join(cam_path, "*.png")) + 
+                        glob.glob(os.path.join(cam_path, "*.jpeg"))
+                    )
                     if image_files:
                         # Load first image to get size
                         test_image = cv2.imread(image_files[0])
                         if test_image is not None:
                             h, w = test_image.shape[:2]
-                            # Set image size in BEV converter
+                            # Set image size in BEV converter (same as test_preprocess_label.py)
                             preprocessor.multiview_matcher.bev_converter.set_image_size(cam_name, w, h)
-                            logger.info(f"Set image size for {cam_name} (folder {cam_folder}): {w}x{h}")
+                            logger.info(f"Set image size for {cam_name}: {w}x{h}")
                         else:
                             logger.warning(f"Could not load image for {cam_name} from {image_files[0]}")
                     else:
@@ -3367,7 +3508,36 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
             
             # Run preprocessing (this may take a while)
+            # CRITICAL: Ensure multi_camera_detections has the correct structure
+            # Log before preprocessing to verify structure
+            logger.info(f"Calling preprocess() with {len(multi_camera_detections)} cameras:")
+            logger.info(f"  n_clusters setting: {n_clusters}")
+            for cam_name in sorted(multi_camera_detections.keys()):
+                num_frames = len(multi_camera_detections[cam_name])
+                total_dets = sum(len(frame_bboxes) for frame_bboxes in multi_camera_detections[cam_name])
+                logger.info(f"  {cam_name}: {num_frames} frames, {total_dets} total detections")
+            
+            # Verify preprocessor has correct n_clusters
+            if preprocessor.n_clusters != n_clusters:
+                logger.error(f"CRITICAL: preprocessor.n_clusters={preprocessor.n_clusters} != settings n_clusters={n_clusters}")
+            if preprocessor.multiview_matcher.n_clusters != n_clusters:
+                logger.error(f"CRITICAL: multiview_matcher.n_clusters={preprocessor.multiview_matcher.n_clusters} != settings n_clusters={n_clusters}")
+            
             global_id_map = preprocessor.preprocess(multi_camera_detections)
+            
+            # Log after preprocessing to verify results
+            logger.info(f"Preprocessing completed. Got {len(global_id_map)} mappings.")
+            if len(global_id_map) > 0:
+                # Count unique global IDs
+                unique_ids = set(global_id_map.values())
+                logger.info(f"  Unique global IDs: {len(unique_ids)}")
+                # Count mappings per camera
+                cam_counts = {}
+                for (f_idx, cam_name, local_id), gid in global_id_map.items():
+                    if cam_name not in cam_counts:
+                        cam_counts[cam_name] = 0
+                    cam_counts[cam_name] += 1
+                logger.info(f"  Mappings per camera: {cam_counts}")
             
             # Preprocessing completed, set to 85
             progress.setValue(85)
@@ -3445,8 +3615,8 @@ class MainWindow(QtWidgets.QMainWindow):
             centroids_by_final_id = preprocessor.get_centroids_by_final_id()
             
             # Update ground_points for each person based on cluster centroids
-            # Track which (frame_idx, person_id) pairs have been updated to avoid duplicates
-            updated_pairs = set()
+            # IMPORTANT: Update ALL person entries with the same personID (not just the first one)
+            # This ensures that when loading frames, any person entry will have the correct centroid
             
             for frame_idx in range(frame_count):
                 if frame_idx >= len(all_annotations):
@@ -3454,29 +3624,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 frame_data = all_annotations[frame_idx]
                 
+                # Get centroid for each unique personID in this frame
+                person_id_to_centroid = {}  # {person_id: (grid_x, grid_y)}
+                
                 for person_idx, person in enumerate(frame_data):
                     person_id = person.get("personID")
-                    if person_id is not None:
-                        # Only update once per (frame_idx, person_id) pair to avoid duplicates
-                        pair_key = (frame_idx, person_id)
-                        if pair_key in updated_pairs:
-                            continue
-                        
+                    if person_id is not None and person_id not in person_id_to_centroid:
                         # Get centroid for this person in this frame
                         centroid_bev = centroids_by_final_id.get((frame_idx, person_id))
                         if centroid_bev is not None:
                             # Convert BEV coordinates (memory coordinates) to world grid coordinates
-                            # For now, BEV coordinates are already in world grid space (identity transform)
-                            # If transformation is needed, use self._mem_to_worldgrid() method
                             mem_x, mem_y = centroid_bev[0], centroid_bev[1]
                             
                             # Convert to world grid coordinates
-                            # Note: Currently _mem_to_worldgrid returns identity, but should use proper transform if available
                             grid_x, grid_y = self._mem_to_worldgrid(mem_x, mem_y)
-                            
-                            # Update ground_points only for the first person with this personID in this frame
-                            frame_data[person_idx]["ground_points"] = [float(grid_x), float(grid_y)]
-                            updated_pairs.add(pair_key)
+                            person_id_to_centroid[person_id] = (float(grid_x), float(grid_y))
+                
+                # Update ground_points for ALL person entries with the same personID
+                updated_count = 0
+                for person_idx, person in enumerate(frame_data):
+                    person_id = person.get("personID")
+                    if person_id is not None and person_id in person_id_to_centroid:
+                        grid_x, grid_y = person_id_to_centroid[person_id]
+                        # Update ground_points for this person entry
+                        frame_data[person_idx]["ground_points"] = [grid_x, grid_y]
+                        updated_count += 1
+                
+                if frame_idx == 0 and updated_count > 0:
+                    logger.info(f"Frame {frame_idx}: Updated ground_points for {updated_count} person entries with {len(person_id_to_centroid)} unique personIDs")
             
             # Save updated annotations: progress from 85 to 100 (15 points)
             progress.setValue(85)
