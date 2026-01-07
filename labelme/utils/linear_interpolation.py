@@ -22,7 +22,6 @@ def get_camera_angles(rvec):
     
     is_top_down = elevation_deg >= 60.0
     is_side_view = min(abs(azimuth_deg - a) for a in [0, 90, 180, 270, 360]) <= 30.0
-    
     return {
         'elevation': elevation_deg,
         'azimuth': azimuth_deg,
@@ -124,7 +123,6 @@ def estimate_distance_from_camera(bbox_center_px, camera_extrinsics, camera_intr
     cam_pos = -R.T @ t
     if ray_world[2] == 0:
         return np.inf
-
     s = (ground_z - cam_pos[2]) / ray_world[2]
     ground_point = cam_pos + s * ray_world
     distance = np.linalg.norm(ground_point - cam_pos)

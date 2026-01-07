@@ -559,7 +559,6 @@ class PreprocessLabel:
                 print(f"  Processed {frame_idx + 1}/{num_frames} frames...")
         
         print(f"Multiview matching completed. Found {sum(len(m) for m in frame_multiview_maps.values())} mappings.")
-        
         # Step 2: Temporal tracking of frame_global_ids across frames
         print("Step 2: Temporal tracking across frames...")
         
@@ -607,7 +606,7 @@ class PreprocessLabel:
                 max_distance=self.max_distance_tracking
             )
             temporal_global_id_map = object_tracker.assign_global_id()
-        # temporal_global_id_map: {(frame_idx, obj_idx): final_global_id}
+            
         
         # Store for later access
         self.temporal_global_id_map = temporal_global_id_map
