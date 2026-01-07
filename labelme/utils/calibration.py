@@ -709,8 +709,6 @@ def generate_bev_from_cameras(
                 ref_T_pix,
                 (n_x, n_y),
                 flags=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT,
-                borderValue=(0, 0, 0)
             )
             
             # Convert BGR to RGB

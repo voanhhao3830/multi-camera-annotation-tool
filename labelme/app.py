@@ -3600,42 +3600,39 @@ class MainWindow(QtWidgets.QMainWindow):
             if root_dirs:
                 logger.info(f"Checking individual camera JSON files, root_dirs: {root_dirs}, output_dir: {self.output_dir}")
                 for frame_idx in range(current_frame_index - 1, -1, -1):
-                    try:
-                        # Scan camera data for this frame (handles both AICV and legacy structures)
-                        camera_data = _scan_multi_camera_data(root_dirs, frame_idx)
-                        logger.debug(f"Scanned {len(camera_data)} cameras for frame {frame_idx}")
+                    # Scan camera data for this frame (handles both AICV and legacy structures)
+                    camera_data = _scan_multi_camera_data(root_dirs, frame_idx)
+                    logger.debug(f"Scanned {len(camera_data)} cameras for frame {frame_idx}")
+                    
+                    # Check if any camera has labels for this frame
+                    for cam_data in camera_data:
+                        image_path = cam_data["image_path"]
+                        # Try original path first
+                        label_file = f"{osp.splitext(image_path)[0]}.json"
                         
-                        # Check if any camera has labels for this frame
-                        for cam_data in camera_data:
-                            image_path = cam_data["image_path"]
-                            # Try original path first
-                            label_file = f"{osp.splitext(image_path)[0]}.json"
-                            
-                            # Check original location
-                            if osp.exists(label_file) and LabelFile.is_label_file(label_file):
+                        # Check original location
+                        if osp.exists(label_file) and LabelFile.is_label_file(label_file):
+                            try:
+                                label_file_obj = LabelFile(label_file)
+                                if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
+                                    logger.info(f"Found labels in original location for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file}")
+                                    return frame_idx
+                            except Exception as e:
+                                logger.debug(f"Error reading label file {label_file}: {e}")
+                        
+                        # Also check output_dir if set
+                        if self.output_dir:
+                            label_file_without_path = osp.basename(label_file)
+                            label_file_output = osp.join(self.output_dir, label_file_without_path)
+                            if osp.exists(label_file_output) and LabelFile.is_label_file(label_file_output):
                                 try:
-                                    label_file_obj = LabelFile(label_file)
+                                    label_file_obj = LabelFile(label_file_output)
                                     if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
-                                        logger.info(f"Found labels in original location for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file}")
+                                        logger.info(f"Found labels in output_dir for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file_output}")
                                         return frame_idx
                                 except Exception as e:
-                                    logger.debug(f"Error reading label file {label_file}: {e}")
-                            
-                            # Also check output_dir if set
-                            if self.output_dir:
-                                label_file_without_path = osp.basename(label_file)
-                                label_file_output = osp.join(self.output_dir, label_file_without_path)
-                                if osp.exists(label_file_output) and LabelFile.is_label_file(label_file_output):
-                                    try:
-                                        label_file_obj = LabelFile(label_file_output)
-                                        if label_file_obj.shapes and len(label_file_obj.shapes) > 0:
-                                            logger.info(f"Found labels in output_dir for frame {frame_idx}, camera {cam_data.get('camera_id')}: {label_file_output}")
-                                            return frame_idx
-                                    except Exception as e:
-                                        logger.debug(f"Error reading label file {label_file_output}: {e}")
-                    except Exception as e:
-                        logger.debug(f"Error checking frame {frame_idx}: {e}")
-                        continue
+                                    logger.debug(f"Error reading label file {label_file_output}: {e}")
+
         
         logger.warning(f"No previous frame with labels found before frame {current_frame_index}")
         return None
@@ -5180,6 +5177,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Load calibrations
         self.camera_calibrations = {}
+        camera_data = sorted(camera_data, key=lambda x: int(x["camera_id"].replace("Camera", "")))
         for cam_data in camera_data:
             camera_id = cam_data["camera_id"]
             calibration_path = cam_data.get("calibration_path")
@@ -5686,7 +5684,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # and update them based on new 3D position
         if not self.multi_camera_canvas or not self.multi_camera_data:
             return
-        
         # Remove old projections (only BEV-projected boxes)
         for idx, cam_data in enumerate(self.multi_camera_data):
             cell = self.multi_camera_canvas.camera_cells[idx]

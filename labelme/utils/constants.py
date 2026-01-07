@@ -17,10 +17,10 @@ from typing import Tuple, List
 # ============================================================================
 
 # Default box size (width, height, depth) in world grid units
-DEFAULT_BOX_WIDTH = 10.0  # Width of bounding box
-DEFAULT_BOX_HEIGHT = 10.0  # Height of bounding box  
-DEFAULT_BOX_DEPTH = 10.0  # Depth of bounding box
-DEFAULT_BOX_SIZE = 10.0  # Legacy: kept for backward compatibility
+DEFAULT_BOX_WIDTH = 40.0  # Width of bounding box
+DEFAULT_BOX_HEIGHT = 40.0  # Height of bounding box  
+DEFAULT_BOX_DEPTH = 40.0  # Depth of bounding box
+DEFAULT_BOX_SIZE = 40.0  # Legacy: kept for backward compatibility
 
 IMAGE_WIDTH = 960
 IMAGE_HEIGHT = 540
@@ -34,7 +34,7 @@ WORLD_GRID_THETA = -2  # degrees
 WORLD_GRID_THETA_RAD = WORLD_GRID_THETA / 180.0 * np.pi
 
 # Scale factor for grid to world conversion
-WORLD_GRID_SCALE = 2.5
+WORLD_GRID_SCALE = 2.5 / 4
 
 # Translation offset for grid to world conversion
 WORLD_GRID_TX = -76
@@ -58,12 +58,12 @@ WORLDCOORD2WORLDGRID_MAT = np.linalg.inv(WORLDGRID2WORLDCOORD_MAT).astype(np.flo
 # ============================================================================
 
 # Default BEV grid dimensions
-DEFAULT_BEV_X = int(200)   # Grid X dimension (pixels)
-DEFAULT_BEV_Y = int(160 )  # Grid Y dimension (pixels)
+DEFAULT_BEV_X = int(200) * 4  # Grid X dimension (pixels)
+DEFAULT_BEV_Y = int(160 ) * 4 # Grid Y dimension (pixels)
 DEFAULT_BEV_Z = 2     # Grid Z dimension (height levels)
 
 # Default BEV bounds in world units [XMIN, XMAX, YMIN, YMAX, ZMIN, ZMAX]
-DEFAULT_BEV_BOUNDS = [0, int(200), 0, int(160), 0, 2]
+DEFAULT_BEV_BOUNDS = [0, int(200) * 4, 0, int(160) * 4, 0, 2]
 
 
 # ============================================================================

@@ -472,7 +472,7 @@ class MultiCameraCanvas(QtWidgets.QWidget):
                         if cell.image_rect.contains(global_marker):
                             # Draw a crosshair/circle marker
                             marker_size = 8
-                            p.setPen(QtGui.QPen(QtGui.QColor(255, 0, 255), 2))  # Magenta color
+                            p.setPen(QtGui.QPen(QtGui.QColor(0, 255, 0), 1))  # Magenta color
                             p.setBrush(QtCore.Qt.NoBrush)
                             
                             # Draw crosshair
