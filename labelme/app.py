@@ -3145,10 +3145,10 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Clamp values to valid range
             start_frame = max(0, min(start_frame, original_total_frames - 1))
-            end_frame = max(start_frame + 1, min(end_frame, original_total_frames))
+            end_frame = max(start_frame, min(end_frame, original_total_frames - 1))
             
-            # Apply frame range: [start_frame, end_frame)
-            annotation_files = annotation_files[start_frame:end_frame]
+            # Apply frame range: [start_frame, end_frame] (inclusive on both ends)
+            annotation_files = annotation_files[start_frame:end_frame + 1]
             
             frame_count = len(annotation_files)
             

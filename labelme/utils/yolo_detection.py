@@ -6,6 +6,7 @@ import os
 import os.path as osp
 import glob
 import json
+import re
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Callable
 from loguru import logger
@@ -32,6 +33,26 @@ def convert_to_native(obj):
     elif isinstance(obj, list):
         return [convert_to_native(item) for item in obj]
     return obj
+
+
+def sort_image_files_by_frame_number(image_files: List[str]) -> List[str]:
+    """
+    Sort image files by frame number extracted from filename.
+    Handles formats like: "20.jpg", "001.jpg", "frame_20.jpg", etc.
+    Falls back to string sort if no number found.
+    """
+    def extract_frame_number(filepath: str) -> int:
+        """Extract frame number from filename"""
+        filename = os.path.basename(filepath)
+        # Try to find numbers in filename (e.g., "20.jpg" -> 20, "001.jpg" -> 1)
+        numbers = re.findall(r'\d+', filename)
+        if numbers:
+            # Use the last number found (usually the frame number)
+            return int(numbers[-1])
+        # If no number found, return a large number to put at end
+        return 999999
+    
+    return sorted(image_files, key=extract_frame_number)
 
 
 def run_yolo_detection(
@@ -90,7 +111,7 @@ def run_yolo_detection(
             if not os.path.isdir(cam_path):
                 continue
                 
-            image_files = sorted(
+            image_files = sort_image_files_by_frame_number(
                 glob.glob(os.path.join(cam_path, "*.jpg")) + 
                 glob.glob(os.path.join(cam_path, "*.png")) + 
                 glob.glob(os.path.join(cam_path, "*.jpeg"))
@@ -111,7 +132,9 @@ def run_yolo_detection(
                     for result in results:
                         boxes = result.boxes
                         for box in boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            # Use squeeze() to handle both (4,) and (1, 4) tensor shapes safely
+                            xyxy = box.xyxy.squeeze().cpu().numpy()
+                            x1, y1, x2, y2 = xyxy
                             detections.append({
                                 "xmin": float(x1),  # Keep as float to preserve YOLO precision
                                 "ymin": float(y1),  # Keep as float to preserve YOLO precision
@@ -225,6 +248,7 @@ def run_yolo_detection_return_dict(
         - frame_images: List[Dict[str, np.ndarray]] - [frame0_images, frame1_images, ...]
           where each frame is {camera_name: image}
     """
+    print(f"Running YOLO detection with model: {model_path}, image_subsets_folder: {image_subsets_folder}, camera_folders: {camera_folders}, frame_count: {frame_count}, start_frame: {start_frame}, conf_threshold: {conf_threshold}, progress_callback: {progress_callback}")
     try:
         from ultralytics import YOLO
         import cv2
@@ -262,7 +286,7 @@ def run_yolo_detection_return_dict(
             if not os.path.isdir(cam_path):
                 continue
                 
-            image_files = sorted(
+            image_files = sort_image_files_by_frame_number(
                 glob.glob(os.path.join(cam_path, "*.jpg")) + 
                 glob.glob(os.path.join(cam_path, "*.png")) + 
                 glob.glob(os.path.join(cam_path, "*.jpeg"))
@@ -284,7 +308,9 @@ def run_yolo_detection_return_dict(
                     for result in results:
                         boxes = result.boxes
                         for box in boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            # Use squeeze() to handle both (4,) and (1, 4) tensor shapes safely
+                            xyxy = box.xyxy.squeeze().cpu().numpy()
+                            x1, y1, x2, y2 = xyxy
                             detections.append({
                                 "xmin": float(x1),  # Keep as float to preserve YOLO precision
                                 "ymin": float(y1),  # Keep as float to preserve YOLO precision
@@ -310,6 +336,17 @@ def run_yolo_detection_return_dict(
                 if camera_id not in multi_camera_detections:
                     multi_camera_detections[camera_id] = []
                 multi_camera_detections[camera_id].append([])
+    
+    # Ensure all cameras have exactly frame_count frames (fill missing frames with empty lists)
+    for cam_name in camera_names:
+        if cam_name not in multi_camera_detections:
+            multi_camera_detections[cam_name] = []
+        # Fill missing frames
+        while len(multi_camera_detections[cam_name]) < frame_count:
+            multi_camera_detections[cam_name].append([])
+        # Trim if too many frames
+        if len(multi_camera_detections[cam_name]) > frame_count:
+            multi_camera_detections[cam_name] = multi_camera_detections[cam_name][:frame_count]
     
     logger.info(f"Completed YOLO detection for {frame_count} frames")
     return multi_camera_detections, frame_images
