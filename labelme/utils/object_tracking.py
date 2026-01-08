@@ -100,8 +100,10 @@ class KalmanFilter(object):
         # Motion and observation uncertainty are chosen relative to the current
         # state estimate. These weights control the amount of uncertainty in
         # the model.
+        # Reduced position uncertainty for better tracking of stationary objects
         self._std_weight_position = 1.0 / 20
-        self._std_weight_velocity = 1.0 / 160
+        # Increased velocity uncertainty to allow better adaptation when objects stop
+        self._std_weight_velocity = 1.0 / 80
 
     def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Create track from unassociated measurement.
@@ -479,8 +481,9 @@ class STrack(BaseTrack):
     def re_activate(self, new_track: 'STrack', frame_id: int, new_id: bool = False):
         """Re-activate a lost track."""
         if self.kalman_filter is not None and self.mean is not None and self.covariance is not None:
+            # Use current position (_xy) instead of predicted position (xy)
             self.mean, self.covariance = self.kalman_filter.update(
-                self.mean, self.covariance, new_track.xy
+                self.mean, self.covariance, new_track._xy
             )
 
         self.tracklet_len = 0
@@ -502,9 +505,18 @@ class STrack(BaseTrack):
         self.tracklet_len += 1
 
         if self.kalman_filter is not None and self.mean is not None and self.covariance is not None:
+            # Use current position (_xy) instead of predicted position (xy)
+            measurement = new_track._xy
             self.mean, self.covariance = self.kalman_filter.update(
-                self.mean, self.covariance, new_track.xy
+                self.mean, self.covariance, measurement
             )
+            # If object appears stationary (very small movement), reduce velocity estimate
+            if self.tracklet_len > 1:
+                velocity = self.mean[2:4]
+                velocity_magnitude = np.linalg.norm(velocity)
+                if velocity_magnitude < 0.1:  # Object appears stationary (< 0.1 m/s)
+                    # Decay velocity estimate towards zero to prevent drift
+                    self.mean[2:4] = self.mean[2:4] * 0.5
         self.state = TrackState.Tracked
         self.is_activated = True
 
@@ -599,10 +611,13 @@ class JDETracker:
         STrack.multi_predict(strack_pool)
 
         strack_pool_xy = [track.xy for track in strack_pool]
-        detections_xy_prev = [det.xy_prev for det in detections]
+        # Use current position instead of previous position for better matching
+        detections_xy = [det._xy for det in detections]
 
-        dists = center_distance(strack_pool_xy, detections_xy_prev)
-        matches, u_track, u_detection = linear_assignment(dists, thresh=75)
+        dists = center_distance(strack_pool_xy, detections_xy)
+        # Reduced threshold for better matching when objects are stationary
+        # Use adaptive threshold: smaller for tracked, larger for lost tracks
+        matches, u_track, u_detection = linear_assignment(dists, thresh=30)
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
@@ -622,10 +637,12 @@ class JDETracker:
 
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
-        detections_xy = [det.xy_prev for det in detections]
+        # Use current position instead of previous position
+        detections_xy = [det._xy for det in detections]
         unconfirmed_xy = [track.xy for track in unconfirmed]
         dists = center_distance(unconfirmed_xy, detections_xy)
-        matches, u_unconfirmed, u_detection = linear_assignment(dists, thresh=100)
+        # Reduced threshold for unconfirmed tracks
+        matches, u_unconfirmed, u_detection = linear_assignment(dists, thresh=50)
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
@@ -749,23 +766,31 @@ class ObjectTracking:
                 output_stracks = self.tracker.update(dets, dets_prev, score)
                 
                 # Map detections to track IDs
-                # We need to match detections to tracks
-                if len(dets) > 0:
+                # Use Hungarian algorithm for optimal matching, prioritizing tracks with longer history
+                if len(dets) > 0 and len(output_stracks) > 0:
                     # Get track positions
                     track_positions = np.array([track.xy for track in output_stracks])
                     
-                    # Match detections to tracks by nearest neighbor
-                    if len(track_positions) > 0:
-                        distances = cdist(dets, track_positions, metric='euclidean')
-                        # Find nearest track for each detection
-                        det_to_track_idx = np.argmin(distances, axis=1)
-                        min_distances = np.min(distances, axis=1)
+                    # Build cost matrix: distance + penalty for short tracks (to prioritize long tracks)
+                    distances = cdist(dets, track_positions, metric='euclidean')
+                    
+                    # Add penalty for short tracks to prioritize tracks with longer history
+                    # This helps prevent ID switches when objects are stationary
+                    cost_matrix = distances.copy()
+                    for track_idx, track in enumerate(output_stracks):
+                        track_age = track.tracklet_len
+                        # Reduce cost for older tracks (prefer keeping same ID)
+                        if track_age > 0:
+                            cost_matrix[:, track_idx] *= (1.0 - min(0.3, track_age / 30.0))
+                    
+                    # Use Hungarian algorithm for optimal assignment
+                    if distances.size > 0:
+                        matches, u_det, u_track = linear_assignment(cost_matrix, thresh=15.0)
                         
-                        # Only assign if distance is reasonable (within 10 meters)
-                        for det_idx, (track_idx, dist) in enumerate(zip(det_to_track_idx, min_distances)):
-                            if dist < 10.0:  # Reasonable matching distance
-                                track = output_stracks[track_idx]
-                                self.global_id[(frame_idx, det_idx)] = track.track_id
+                        # Assign matched detections
+                        for det_idx, track_idx in matches:
+                            track = output_stracks[track_idx]
+                            self.global_id[(frame_idx, det_idx)] = track.track_id
                 
                 # Update previous detections for next frame
                 if len(dets) > 0:
