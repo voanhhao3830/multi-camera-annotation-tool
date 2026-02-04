@@ -2307,6 +2307,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ground_points = person.get("ground_points")
                 box_3d = person.get("box_3d")
                 locked = person.get("locked", False)
+                action = person.get("action", "walking")  # Default to "walking" if not specified
                 
                 # Debug: count persons with/without ground_points
                 if ground_points and len(ground_points) >= 2:
@@ -2320,7 +2321,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     person_id_to_data[person_id] = {
                         'ground_points': ground_points,
                         'box_3d': box_3d,
-                        'locked': locked
+                        'locked': locked,
+                        'action': action
                     }
                 else:
                     # If current entry has ground_points but stored one doesn't, use current
@@ -2332,6 +2334,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     # Update locked state (use True if any entry is locked)
                     if locked:
                         person_id_to_data[person_id]['locked'] = True
+                    # Update action (use first non-default action if available)
+                    if action != "walking" and person_id_to_data[person_id].get('action') == "walking":
+                        person_id_to_data[person_id]['action'] = action
             
             # Debug log
             if total_persons > 0:
@@ -2344,6 +2349,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ground_points = data.get('ground_points')
                 box_3d = data.get('box_3d')
                 locked = data.get('locked', False)
+                action = data.get('action', 'walking')
                 point_added_to_bev = False
                 
                 # Add 3D box on BEV if box_3d metadata is available
@@ -2380,6 +2386,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # Restore locked state if available (don't emit signal during load)
                                 if locked:
                                     self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                # Restore action
+                                self.bev_canvas.setPointAction(person_id, action)
                                 person_ids_with_bev_points.add(person_id)
                                 point_added_to_bev = True
                             
@@ -2414,6 +2422,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                         # Restore locked state if available (don't emit signal during load)
                                         if locked:
                                             self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                        # Restore action
+                                        self.bev_canvas.setPointAction(person_id, action)
                                         person_ids_with_bev_points.add(person_id)
                                         point_added_to_bev = True
                                         logger.debug(f"Added BEV point for person {person_id} from ground_points: ({grid_x:.2f}, {grid_y:.2f})")
@@ -2487,6 +2497,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                         # Restore locked state if available (don't emit signal during load)
                                                         if locked:
                                                             self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                                        # Restore action
+                                                        self.bev_canvas.setPointAction(person_id, action)
                                                         person_ids_with_bev_points.add(person_id)
                                                         point_added_to_bev = True
                                                         logger.info(f"Computed BEV point for person {person_id} from view {view_num}")
@@ -2505,6 +2517,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # Restore locked state if available (don't emit signal during load)
                                 if locked:
                                     self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                # Restore action
+                                self.bev_canvas.setPointAction(person_id, action)
                                 person_ids_with_bev_points.add(person_id)
                                 logger.warning(f"Added default BEV point for person {person_id} (no valid ground_points or views)")
             
@@ -2735,7 +2749,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         logger.warning(f"View index {view_idx} out of range for person {person_id}, viewNum {view_num}")
         
-        # Update ground_points and locked state from BEV points if available
+        # Update ground_points, locked state, and action from BEV points if available
         # BEV points are in memory coordinates, need to convert back to world grid
         if self.bev_canvas and self.bev_canvas.points:
             for mem_x, mem_y, label, group_id in self.bev_canvas.points:
@@ -2745,6 +2759,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     persons[group_id]["ground_points"] = [grid_x, grid_y]
                     # Update locked state
                     persons[group_id]["locked"] = self.bev_canvas.isPointLocked(group_id)
+                    # Update action
+                    persons[group_id]["action"] = self.bev_canvas.getPointAction(group_id)
         
         # Update 3D bounding box information from BEV boxes if available
         # Store x, y, z (center position) and w, h, d (box dimensions)
@@ -3899,6 +3915,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     views = person.get("views", [])
                     box_3d = person.get("box_3d")  # Load 3D box metadata if available
                     locked = person.get("locked", False)
+                    action = person.get("action", "walking")  # Load action, default to "walking"
                     
                     if person_id is None:
                         continue
@@ -3935,6 +3952,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                     self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
                                     if locked:
                                         self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                    # Set action
+                                    self.bev_canvas.setPointAction(person_id, action)
                                     person_ids_with_bev_points.add(person_id)
                                     point_added_to_bev = True
                         except Exception as box_e:
@@ -3954,6 +3973,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                     self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
                                     if locked:
                                         self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                    # Set action
+                                    self.bev_canvas.setPointAction(person_id, action)
                                     person_ids_with_bev_points.add(person_id)
                                     point_added_to_bev = True
                         
@@ -4000,6 +4021,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                                             self.bev_canvas.addPoint(mem_x, mem_y, "object", person_id)
                                                             if locked:
                                                                 self.bev_canvas.setPointLocked(person_id, True, emit_signal=False)
+                                                            # Set action
+                                                            self.bev_canvas.setPointAction(person_id, action)
                                                             person_ids_with_bev_points.add(person_id)
                                                             point_added_to_bev = True
                                                             break
@@ -5816,11 +5839,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             x=x, y=y, z=z,
             w=w, h=h, d=d,
-            group_id=next_group_id
+            group_id=next_group_id,
+            action="walking"  # Default action for new boxes
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            x, y, z, w, h, d, label, group_id = dialog.getValues()
+            x, y, z, w, h, d, label, group_id, action = dialog.getValues()
             
             if not label:
                 logger.warning("Label is required")
@@ -5835,6 +5859,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Add to BEV canvas
             if self.bev_canvas:
                 self.bev_canvas.addBox3D(x, y, z, w, h, d, label, group_id)
+                # Set action for the group_id
+                self.bev_canvas.setPointAction(group_id, action)
             
             # Update ground point list
             self._update_ground_point_list()
@@ -5889,17 +5915,24 @@ class MainWindow(QtWidgets.QMainWindow):
         
         center, size, rotation, label, group_id = box_data
         
+        # Get current action for this group_id
+        current_action = self.bev_canvas.getPointAction(group_id)
+        
         # Open edit dialog
         dialog = Box3DDialog(
             self,
             x=center[0], y=center[1], z=center[2],
             w=size[0], h=size[1], d=size[2],
-            label=label, group_id=group_id
+            label=label, group_id=group_id,
+            action=current_action
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            x, y, z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            x, y, z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
             old_group_id = group_id  # Store old group_id for updating colors
+            
+            # Update action
+            self.bev_canvas.setPointAction(new_group_id, new_action)
             
             # Update box in BEV
             self.bev_canvas.updateBox3D(box_idx, x, y, z, new_w, new_h, new_d)
@@ -5996,11 +6029,12 @@ class MainWindow(QtWidgets.QMainWindow):
             x=grid_x, y=grid_y, z=0.0,
             w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label="object",
-            group_id=next_group_id
+            group_id=next_group_id,
+            action="walking"  # Default action for new points
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
             
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
@@ -6009,12 +6043,14 @@ class MainWindow(QtWidgets.QMainWindow):
             # Add the point to BEV canvas
             if self.bev_canvas:
                 self.bev_canvas.addPoint(mem_x, mem_y, new_label, new_group_id)
+                # Set action for the new point
+                self.bev_canvas.setPointAction(new_group_id, new_action)
             
             # Update ground point list
             self._update_ground_point_list()
             self.setDirty()
             
-            logger.info(f"Point placed at grid({new_x}, {new_y}) with group_id={new_group_id}")
+            logger.info(f"Point placed at grid({new_x}, {new_y}) with group_id={new_group_id}, action={new_action}")
 
     def _on_bev_point_selected(self, group_id: Optional[int]):
         """Handle point selection - highlight related bounding boxes and project to cameras without objects"""
@@ -6081,26 +6117,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # Convert back to grid coordinates for display
         grid_x, grid_y = self._mem_to_worldgrid(x, y)
         
+        # Get current action for this point
+        current_action = self.bev_canvas.getPointAction(gid)
+        
         from labelme.widgets.box3d_dialog import Box3DDialog
         dialog = Box3DDialog(
             self,
             x=grid_x, y=grid_y, z=0.0,
             w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label=label,
-            group_id=gid
+            group_id=gid,
+            action=current_action
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id = dialog.getValues()
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
             
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
             
             # Debug logging
-            logger.info(f"Updating BEV point: old_group_id={old_group_id}, new_group_id={new_group_id}")
+            logger.info(f"Updating BEV point: old_group_id={old_group_id}, new_group_id={new_group_id}, action={new_action}")
             
             # Update point
             self.bev_canvas.updatePoint(point_idx, mem_x, mem_y, new_label, new_group_id)
+            
+            # Update action for this point
+            self.bev_canvas.setPointAction(new_group_id, new_action)
             
             # Clear selection so point is drawn with its group_id color, not selection color
             self.bev_canvas.selected_point_idx = None

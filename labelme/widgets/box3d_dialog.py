@@ -11,7 +11,7 @@ class Box3DDialog(QtWidgets.QDialog):
     
     def __init__(self, parent=None, x: float = 0.0, y: float = 0.0, z: float = 0.0,
                  w: float = 50.0, h: float = 50.0, d: float = 50.0,
-                 label: str = "object", group_id: Optional[int] = None):
+                 label: str = "object", group_id: Optional[int] = None, action: str = "walking"):
         super().__init__(parent)
         self.setWindowTitle("3D Box Parameters")
         self.setModal(True)
@@ -95,6 +95,15 @@ class Box3DDialog(QtWidgets.QDialog):
         self.edit_group_id.setSpecialValueText("None")
         label_layout.addWidget(self.edit_group_id, 1, 1)
         
+        label_layout.addWidget(QtWidgets.QLabel("Action:"), 2, 0)
+        self.edit_action = QtWidgets.QComboBox()
+        self.edit_action.addItems(["walking", "eating", "sitting", "standing"])
+        # Set current action
+        action_index = self.edit_action.findText(action)
+        if action_index >= 0:
+            self.edit_action.setCurrentIndex(action_index)
+        label_layout.addWidget(self.edit_action, 2, 1)
+        
         label_group.setLayout(label_layout)
         layout.addWidget(label_group)
         
@@ -108,8 +117,8 @@ class Box3DDialog(QtWidgets.QDialog):
         
         self.setLayout(layout)
     
-    def getValues(self) -> tuple[float, float, float, float, float, float, str, Optional[int]]:
-        """Get all values"""
+    def getValues(self) -> tuple[float, float, float, float, float, float, str, Optional[int], str]:
+        """Get all values including action"""
         group_id = self.edit_group_id.value() if self.edit_group_id.value() > 0 else None
         return (
             self.edit_x.value(),
@@ -119,6 +128,7 @@ class Box3DDialog(QtWidgets.QDialog):
             self.edit_h.value(),
             self.edit_d.value(),
             self.edit_label.text(),
-            group_id
+            group_id,
+            self.edit_action.currentText()
         )
 

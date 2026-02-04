@@ -77,6 +77,9 @@ class BEVCanvas(QtWidgets.QWidget):
         # Locked points are "locked label" - cannot be edited and shown in black color
         self.points_locked: dict[Optional[int], bool] = {}  # group_id -> locked (True/False)
         
+        # Track action for each point by group_id
+        self.points_actions: dict[Optional[int], str] = {}  # group_id -> action (walking, eating, sitting, standing)
+        
         # Dragging state for points
         self.dragging_point_idx: Optional[int] = None
         self.drag_start_pos: Optional[QPointF] = None
@@ -235,6 +238,7 @@ class BEVCanvas(QtWidgets.QWidget):
         """Clear all points"""
         self.points = []
         self.points_locked = {}
+        self.points_actions = {}
         self.selected_point_idx = None
         self.hovered_point_idx = None
         self.update()
@@ -247,6 +251,9 @@ class BEVCanvas(QtWidgets.QWidget):
                 # Remove locked state if exists
                 if group_id in self.points_locked:
                     del self.points_locked[group_id]
+                # Remove action if exists
+                if group_id in self.points_actions:
+                    del self.points_actions[group_id]
                 if self.selected_point_idx == i:
                     self.selected_point_idx = None
                 elif self.selected_point_idx is not None and self.selected_point_idx > i:
@@ -276,6 +283,28 @@ class BEVCanvas(QtWidgets.QWidget):
         if group_id is None:
             return False
         return self.points_locked.get(group_id, False)
+    
+    def setPointAction(self, group_id: Optional[int], action: str):
+        """Set action for a point by group_id
+        
+        Args:
+            group_id: Group ID of the point
+            action: Action name (walking, eating, sitting, standing)
+        """
+        if group_id is None:
+            return
+        self.points_actions[group_id] = action
+        self.update()
+    
+    def getPointAction(self, group_id: Optional[int]) -> str:
+        """Get action for a point by group_id
+        
+        Returns:
+            Action name, defaults to "walking" if not set
+        """
+        if group_id is None:
+            return "walking"
+        return self.points_actions.get(group_id, "walking")
 
     def updatePoint(self, point_idx: int, x: Optional[float] = None, y: Optional[float] = None, 
                    label: Optional[str] = None, group_id: Optional[int] = None) -> bool:
