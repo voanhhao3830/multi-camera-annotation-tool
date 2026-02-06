@@ -54,6 +54,16 @@ from labelme.utils.constants import DEFAULT_BOX_SIZE, DEFAULT_BOX_WIDTH, DEFAULT
 from labelme.utils.metadata import save_metadata, load_metadata, get_bev_grid_from_metadata, get_box_size_from_metadata
 from . import utils
 
+# Try to import ActionZoneMapper (optional feature)
+try:
+    import sys
+    sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
+    from action_zone_utils import ActionZoneMapper
+    ACTION_ZONE_MAPPER_AVAILABLE = True
+except ImportError:
+    ACTION_ZONE_MAPPER_AVAILABLE = False
+    logger.warning("ActionZoneMapper not available - action zones feature disabled")
+
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
 
@@ -161,6 +171,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._bev_x = DEFAULT_BEV_X
         self._bev_y = DEFAULT_BEV_Y
         self._bev_bounds = DEFAULT_BEV_BOUNDS.copy()
+        
+        # Action zone mapper for automatic action assignment
+        self.action_zone_mapper = None
         
         # Ground Point List (replaces flags widget)
         self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
@@ -5828,11 +5841,75 @@ class MainWindow(QtWidgets.QMainWindow):
         bev_dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
         self.addDockWidget(Qt.RightDockWidgetArea, bev_dock)
         bev_dock.setVisible(True)
+        
+        # Load action zones if available
+        self._load_action_zones()
+    
+    def _load_action_zones(self) -> None:
+        """Load action zones from JSON file for automatic action assignment"""
+        if not ACTION_ZONE_MAPPER_AVAILABLE:
+            return
+        
+        # Try to find action_zones.json in the data directory
+        root_dir = None
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            root_dir = self._aicv_root_dir
+        elif self._prev_opened_dir:
+            root_dir = self._prev_opened_dir
+        
+        if not root_dir:
+            logger.debug("No root directory found, skipping action zone loading")
+            return
+        
+        # Look for action_zones.json in the root directory
+        zone_file = osp.join(root_dir, "action_zones.json")
+        
+        if not osp.exists(zone_file):
+            logger.debug(f"No action zones file found at {zone_file}")
+            return
+        
+        try:
+            # Initialize action zone mapper with BEV dimensions
+            self.action_zone_mapper = ActionZoneMapper(
+                zone_file,
+                image_width=int(self._bev_x),
+                image_height=int(self._bev_y)
+            )
+            logger.info(f"Loaded action zones from {zone_file}")
+            print(f"✓ Loaded action zones: {len(self.action_zone_mapper.zones)} zones")
+        except Exception as e:
+            logger.warning(f"Failed to load action zones: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _get_action_for_position(self, x: float, y: float) -> str:
+        """
+        Get action for a BEV position based on action zones
+        
+        Args:
+            x: X coordinate in world grid (BEV) space
+            y: Y coordinate in world grid (BEV) space
+        
+        Returns:
+            Action name (walking, eating, sitting, standing, etc.)
+        """
+        if self.action_zone_mapper is not None:
+            try:
+                # ActionZoneMapper expects pixel coordinates in BEV space
+                return self.action_zone_mapper.get_action_for_point(x, y, normalized=False)
+            except Exception as e:
+                logger.warning(f"Error getting action from zone mapper: {e}")
+        
+        # Default action if no mapper or error
+        return "walking"
     
     def _on_bev_box_placed(self, x: float, y: float, z: float, w: float, h: float, d: float):
         """Handle box placement from BEV canvas"""
         # Get next unique group_id
         next_group_id = self._get_next_group_id()
+        
+        # Get default action based on position in action zones
+        default_action = self._get_action_for_position(x, y)
         
         # Show dialog to get label and group_id
         dialog = Box3DDialog(
@@ -5840,7 +5917,7 @@ class MainWindow(QtWidgets.QMainWindow):
             x=x, y=y, z=z,
             w=w, h=h, d=d,
             group_id=next_group_id,
-            action="walking"  # Default action for new boxes
+            action=default_action  # Default action based on zone
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
@@ -6022,6 +6099,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Convert mem coordinates to grid coordinates for display
         grid_x, grid_y = self._mem_to_worldgrid(x, y)
         
+        # Get default action based on position in action zones
+        default_action = self._get_action_for_position(grid_x, grid_y)
+        
         # Show dialog for configuration
         from labelme.widgets.box3d_dialog import Box3DDialog
         dialog = Box3DDialog(
@@ -6030,7 +6110,7 @@ class MainWindow(QtWidgets.QMainWindow):
             w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label="object",
             group_id=next_group_id,
-            action="walking"  # Default action for new points
+            action=default_action  # Default action based on zone
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:

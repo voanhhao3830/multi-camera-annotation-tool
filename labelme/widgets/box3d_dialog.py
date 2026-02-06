@@ -97,11 +97,15 @@ class Box3DDialog(QtWidgets.QDialog):
         
         label_layout.addWidget(QtWidgets.QLabel("Action:"), 2, 0)
         self.edit_action = QtWidgets.QComboBox()
-        self.edit_action.addItems(["walking", "eating", "sitting", "standing"])
+        self.edit_action.setEditable(True)  # Allow custom actions
+        self.edit_action.addItems(["walking", "eating", "sitting", "standing", "drinking"])
         # Set current action
         action_index = self.edit_action.findText(action)
         if action_index >= 0:
             self.edit_action.setCurrentIndex(action_index)
+        else:
+            # Custom action not in list, set as text
+            self.edit_action.setCurrentText(action)
         label_layout.addWidget(self.edit_action, 2, 1)
         
         label_group.setLayout(label_layout)
