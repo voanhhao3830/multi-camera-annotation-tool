@@ -5903,6 +5903,86 @@ class MainWindow(QtWidgets.QMainWindow):
         # Default action if no mapper or error
         return "walking"
     
+    def _get_current_frame_index(self) -> Optional[int]:
+        """Get current frame index from filename"""
+        if not self.filename:
+            return None
+        try:
+            if self.filename.startswith("Frame_"):
+                return int(self.filename.split("_")[1])
+        except (ValueError, IndexError):
+            pass
+        return None
+    
+    def _get_total_frames(self) -> int:
+        """Get total number of frames"""
+        if self.fileListWidget:
+            return self.fileListWidget.count()
+        return 0
+    
+    def _apply_action_to_frame_range(self, group_id: int, action: str, start_frame: int, end_frame: int) -> None:
+        """
+        Apply action to a group_id across a frame range
+        
+        Args:
+            group_id: Person/object group ID
+            action: Action to apply
+            start_frame: Start frame index (inclusive)
+            end_frame: End frame index (inclusive)
+        """
+        if not hasattr(self, "_aicv_root_dir") or not self._aicv_root_dir:
+            logger.warning("Cannot apply action to frame range: no AICV root directory")
+            return
+        
+        annotation_dir = osp.join(self._aicv_root_dir, "annotations_positions")
+        if not osp.exists(annotation_dir):
+            logger.warning(f"Annotation directory not found: {annotation_dir}")
+            return
+        
+        updated_frames = []
+        for frame_idx in range(start_frame, end_frame + 1):
+            # Try different frame number formats
+            annotation_file = None
+            for fmt in [f"{frame_idx:05d}.json", f"{frame_idx:08d}.json", 
+                       f"{frame_idx:04d}.json", f"{frame_idx}.json"]:
+                path = osp.join(annotation_dir, fmt)
+                if osp.exists(path):
+                    annotation_file = path
+                    break
+            
+            if not annotation_file:
+                logger.debug(f"No annotation file for frame {frame_idx}")
+                continue
+            
+            try:
+                # Load annotations
+                with open(annotation_file, 'r') as f:
+                    annotations = json.load(f)
+                
+                # Update action for all persons with matching group_id
+                modified = False
+                for person in annotations:
+                    if person.get("personID") == group_id:
+                        person["action"] = action
+                        modified = True
+                
+                # Save if modified
+                if modified:
+                    with open(annotation_file, 'w') as f:
+                        json.dump(annotations, f, indent=4)
+                    updated_frames.append(frame_idx)
+                    logger.debug(f"Updated action for group_id {group_id} in frame {frame_idx}")
+            
+            except Exception as e:
+                logger.warning(f"Failed to update frame {frame_idx}: {e}")
+        
+        if updated_frames:
+            logger.info(f"Applied action '{action}' to group_id {group_id} across {len(updated_frames)} frames ({start_frame}-{end_frame})")
+            print(f"✓ Updated action '{action}' for ID {group_id} in frames: {start_frame}-{end_frame} ({len(updated_frames)} files)")
+        else:
+            logger.warning(f"No frames were updated for group_id {group_id}")
+            print(f"⚠ No annotation files found for frames {start_frame}-{end_frame}")
+    
     def _on_bev_box_placed(self, x: float, y: float, z: float, w: float, h: float, d: float):
         """Handle box placement from BEV canvas"""
         # Get next unique group_id
@@ -5911,17 +5991,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Get default action based on position in action zones
         default_action = self._get_action_for_position(x, y)
         
+        # Get frame info for frame range selector
+        current_frame = self._get_current_frame_index()
+        total_frames = self._get_total_frames()
+        
         # Show dialog to get label and group_id
         dialog = Box3DDialog(
             self,
             x=x, y=y, z=z,
             w=w, h=h, d=d,
             group_id=next_group_id,
-            action=default_action  # Default action based on zone
+            action=default_action,  # Default action based on zone
+            current_frame=current_frame,
+            total_frames=total_frames
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            x, y, z, w, h, d, label, group_id, action = dialog.getValues()
+            x, y, z, w, h, d, label, group_id, action, frame_range = dialog.getValues()
             
             if not label:
                 logger.warning("Label is required")
@@ -5938,6 +6024,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bev_canvas.addBox3D(x, y, z, w, h, d, label, group_id)
                 # Set action for the group_id
                 self.bev_canvas.setPointAction(group_id, action)
+            
+            # Apply action to frame range if specified
+            if frame_range is not None:
+                start_frame, end_frame = frame_range
+                self._apply_action_to_frame_range(group_id, action, start_frame, end_frame)
             
             # Update ground point list
             self._update_ground_point_list()
@@ -5995,21 +6086,32 @@ class MainWindow(QtWidgets.QMainWindow):
         # Get current action for this group_id
         current_action = self.bev_canvas.getPointAction(group_id)
         
+        # Get frame info for frame range selector
+        current_frame = self._get_current_frame_index()
+        total_frames = self._get_total_frames()
+        
         # Open edit dialog
         dialog = Box3DDialog(
             self,
             x=center[0], y=center[1], z=center[2],
             w=size[0], h=size[1], d=size[2],
             label=label, group_id=group_id,
-            action=current_action
+            action=current_action,
+            current_frame=current_frame,
+            total_frames=total_frames
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            x, y, z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
+            x, y, z, new_w, new_h, new_d, new_label, new_group_id, new_action, frame_range = dialog.getValues()
             old_group_id = group_id  # Store old group_id for updating colors
             
             # Update action
             self.bev_canvas.setPointAction(new_group_id, new_action)
+            
+            # Apply action to frame range if specified
+            if frame_range is not None:
+                start_frame, end_frame = frame_range
+                self._apply_action_to_frame_range(new_group_id, new_action, start_frame, end_frame)
             
             # Update box in BEV
             self.bev_canvas.updateBox3D(box_idx, x, y, z, new_w, new_h, new_d)
@@ -6102,6 +6204,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Get default action based on position in action zones
         default_action = self._get_action_for_position(grid_x, grid_y)
         
+        # Get frame info for frame range selector
+        current_frame = self._get_current_frame_index()
+        total_frames = self._get_total_frames()
+        
         # Show dialog for configuration
         from labelme.widgets.box3d_dialog import Box3DDialog
         dialog = Box3DDialog(
@@ -6110,11 +6216,13 @@ class MainWindow(QtWidgets.QMainWindow):
             w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label="object",
             group_id=next_group_id,
-            action=default_action  # Default action based on zone
+            action=default_action,  # Default action based on zone
+            current_frame=current_frame,
+            total_frames=total_frames
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action, frame_range = dialog.getValues()
             
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
@@ -6125,6 +6233,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.bev_canvas.addPoint(mem_x, mem_y, new_label, new_group_id)
                 # Set action for the new point
                 self.bev_canvas.setPointAction(new_group_id, new_action)
+            
+            # Apply action to frame range if specified
+            if frame_range is not None:
+                start_frame, end_frame = frame_range
+                self._apply_action_to_frame_range(new_group_id, new_action, start_frame, end_frame)
             
             # Update ground point list
             self._update_ground_point_list()
@@ -6200,6 +6313,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Get current action for this point
         current_action = self.bev_canvas.getPointAction(gid)
         
+        # Get frame info for frame range selector
+        current_frame = self._get_current_frame_index()
+        total_frames = self._get_total_frames()
+        
         from labelme.widgets.box3d_dialog import Box3DDialog
         dialog = Box3DDialog(
             self,
@@ -6207,11 +6324,13 @@ class MainWindow(QtWidgets.QMainWindow):
             w=DEFAULT_BOX_SIZE, h=DEFAULT_BOX_SIZE, d=DEFAULT_BOX_SIZE,  # Default size
             label=label,
             group_id=gid,
-            action=current_action
+            action=current_action,
+            current_frame=current_frame,
+            total_frames=total_frames
         )
         
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
-            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action = dialog.getValues()
+            new_x, new_y, new_z, new_w, new_h, new_d, new_label, new_group_id, new_action, frame_range = dialog.getValues()
             
             # Convert back to mem coordinates
             mem_x, mem_y = self._worldgrid_to_mem(new_x, new_y)
@@ -6224,6 +6343,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Update action for this point
             self.bev_canvas.setPointAction(new_group_id, new_action)
+            
+            # Apply action to frame range if specified
+            if frame_range is not None:
+                start_frame, end_frame = frame_range
+                self._apply_action_to_frame_range(new_group_id, new_action, start_frame, end_frame)
             
             # Clear selection so point is drawn with its group_id color, not selection color
             self.bev_canvas.selected_point_idx = None

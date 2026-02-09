@@ -11,10 +11,14 @@ class Box3DDialog(QtWidgets.QDialog):
     
     def __init__(self, parent=None, x: float = 0.0, y: float = 0.0, z: float = 0.0,
                  w: float = 50.0, h: float = 50.0, d: float = 50.0,
-                 label: str = "object", group_id: Optional[int] = None, action: str = "walking"):
+                 label: str = "object", group_id: Optional[int] = None, action: str = "walking",
+                 current_frame: Optional[int] = None, total_frames: Optional[int] = None):
         super().__init__(parent)
         self.setWindowTitle("3D Box Parameters")
         self.setModal(True)
+        
+        self.current_frame = current_frame
+        self.total_frames = total_frames
         
         layout = QtWidgets.QVBoxLayout()
         
@@ -111,6 +115,49 @@ class Box3DDialog(QtWidgets.QDialog):
         label_group.setLayout(label_layout)
         layout.addWidget(label_group)
         
+        # Frame Range (optional - only show if frame info is provided)
+        if self.current_frame is not None and self.total_frames is not None:
+            frame_group = QtWidgets.QGroupBox("Apply to Frame Range")
+            frame_layout = QtWidgets.QVBoxLayout()
+            
+            # Checkbox to enable frame range
+            self.apply_to_range_checkbox = QtWidgets.QCheckBox("Apply action to multiple frames")
+            self.apply_to_range_checkbox.setChecked(False)
+            self.apply_to_range_checkbox.stateChanged.connect(self._toggle_frame_range)
+            frame_layout.addWidget(self.apply_to_range_checkbox)
+            
+            # Frame range inputs
+            range_layout = QtWidgets.QGridLayout()
+            
+            range_layout.addWidget(QtWidgets.QLabel("Start Frame:"), 0, 0)
+            self.edit_start_frame = QtWidgets.QSpinBox()
+            self.edit_start_frame.setRange(0, self.total_frames - 1)
+            self.edit_start_frame.setValue(self.current_frame)
+            self.edit_start_frame.setEnabled(False)
+            range_layout.addWidget(self.edit_start_frame, 0, 1)
+            
+            range_layout.addWidget(QtWidgets.QLabel("End Frame:"), 0, 2)
+            self.edit_end_frame = QtWidgets.QSpinBox()
+            self.edit_end_frame.setRange(0, self.total_frames - 1)
+            self.edit_end_frame.setValue(self.current_frame)
+            self.edit_end_frame.setEnabled(False)
+            range_layout.addWidget(self.edit_end_frame, 0, 3)
+            
+            # Info label
+            self.frame_range_info = QtWidgets.QLabel(
+                f"Current frame: {self.current_frame} (Total: {self.total_frames})"
+            )
+            self.frame_range_info.setStyleSheet("color: gray; font-size: 10px;")
+            range_layout.addWidget(self.frame_range_info, 1, 0, 1, 4)
+            
+            frame_layout.addLayout(range_layout)
+            frame_group.setLayout(frame_layout)
+            layout.addWidget(frame_group)
+        else:
+            self.apply_to_range_checkbox = None
+            self.edit_start_frame = None
+            self.edit_end_frame = None
+        
         # Buttons
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
@@ -121,9 +168,28 @@ class Box3DDialog(QtWidgets.QDialog):
         
         self.setLayout(layout)
     
-    def getValues(self) -> tuple[float, float, float, float, float, float, str, Optional[int], str]:
-        """Get all values including action"""
+    def _toggle_frame_range(self, state: int) -> None:
+        """Enable/disable frame range inputs"""
+        enabled = (state == QtCore.Qt.Checked)
+        if self.edit_start_frame:
+            self.edit_start_frame.setEnabled(enabled)
+        if self.edit_end_frame:
+            self.edit_end_frame.setEnabled(enabled)
+    
+    def getValues(self) -> tuple[float, float, float, float, float, float, str, Optional[int], str, Optional[tuple[int, int]]]:
+        """Get all values including action and frame range"""
         group_id = self.edit_group_id.value() if self.edit_group_id.value() > 0 else None
+        
+        # Get frame range if applicable
+        frame_range = None
+        if (self.apply_to_range_checkbox and 
+            self.apply_to_range_checkbox.isChecked() and
+            self.edit_start_frame and self.edit_end_frame):
+            start = self.edit_start_frame.value()
+            end = self.edit_end_frame.value()
+            if start <= end:
+                frame_range = (start, end)
+        
         return (
             self.edit_x.value(),
             self.edit_y.value(),
@@ -133,6 +199,7 @@ class Box3DDialog(QtWidgets.QDialog):
             self.edit_d.value(),
             self.edit_label.text(),
             group_id,
-            self.edit_action.currentText()
+            self.edit_action.currentText(),
+            frame_range  # Returns (start, end) or None
         )
 
