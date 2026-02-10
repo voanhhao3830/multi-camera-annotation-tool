@@ -55,6 +55,12 @@ class BEVCanvas(QtWidgets.QWidget):
         self.grid_width = DEFAULT_BEV_X  # Grid X dimension (1200 pixels)
         self.grid_height = DEFAULT_BEV_Y  # Grid Y dimension (800 pixels)
         
+        # Store the actual drawing area (accounting for aspect ratio maintenance)
+        self.draw_offset_x = 0  # X offset for letterboxing
+        self.draw_offset_y = 0  # Y offset for pillarboxing
+        self.draw_width = 0  # Actual drawing width
+        self.draw_height = 0  # Actual drawing height
+        
         # Legacy fields (kept for compatibility but not used with grid scaling)
         self.bev_scale = 1.0  # pixels per meter (legacy)
         self.bev_offset_x = 0.0  # offset in meters (legacy)
@@ -197,6 +203,9 @@ class BEVCanvas(QtWidgets.QWidget):
         """
         Update grid dimensions for coordinate transformation.
         
+        Grid dimensions define the logical coordinate space and should remain constant.
+        When the widget is resized, the screen coordinates change, but grid coordinates stay the same.
+        
         Args:
             grid_width: Grid width in pixels (e.g., DEFAULT_BEV_X = 1200)
             grid_height: Grid height in pixels (e.g., DEFAULT_BEV_Y = 800)
@@ -205,6 +214,53 @@ class BEVCanvas(QtWidgets.QWidget):
         self.grid_width = grid_width
         self.grid_height = grid_height
         self.update()
+    
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """Handle resize event - maintain aspect ratio and adjust coordinate system"""
+        super().resizeEvent(event)
+        old_size = event.oldSize()
+        new_size = event.size()
+        
+        # Calculate the drawable area maintaining aspect ratio
+        self._calculate_drawable_area()
+        
+        if old_size.width() > 0 and old_size.height() > 0:
+            logger.debug(
+                f"BEV Canvas resized: {old_size.width()}x{old_size.height()} → "
+                f"{new_size.width()}x{new_size.height()} "
+                f"(grid: {self.grid_width}x{self.grid_height}, "
+                f"draw: {self.draw_width}x{self.draw_height})"
+            )
+        
+        # Update display
+        self.update()
+    
+    def _calculate_drawable_area(self) -> None:
+        """
+        Calculate the actual drawable area maintaining aspect ratio.
+        
+        When the widget aspect ratio doesn't match grid aspect ratio,
+        we add letterboxing (black bars on sides) or pillarboxing (black bars top/bottom).
+        """
+        widget_width = self.width()
+        widget_height = self.height()
+        
+        # Calculate aspect ratios
+        grid_aspect = self.grid_width / self.grid_height if self.grid_height > 0 else 1.0
+        widget_aspect = widget_width / widget_height if widget_height > 0 else 1.0
+        
+        if widget_aspect > grid_aspect:
+            # Widget is wider than grid - add letterboxing (vertical bars on sides)
+            self.draw_height = widget_height
+            self.draw_width = int(widget_height * grid_aspect)
+            self.draw_offset_x = (widget_width - self.draw_width) // 2
+            self.draw_offset_y = 0
+        else:
+            # Widget is taller than grid - add pillarboxing (horizontal bars on top/bottom)
+            self.draw_width = widget_width
+            self.draw_height = int(widget_width / grid_aspect)
+            self.draw_offset_x = 0
+            self.draw_offset_y = (widget_height - self.draw_height) // 2
     
     def addBox3D(self, x: float, y: float, z: float, w: float, h: float, d: float,
                  label: str = "", group_id: Optional[int] = None, rotation: float = 0.0):
@@ -332,27 +388,40 @@ class BEVCanvas(QtWidgets.QWidget):
     
     def _grid_to_screen(self, grid_x: float, grid_y: float) -> QPointF:
         """
-        Convert grid coordinates (mem coordinates) to screen coordinates.
+        Convert grid coordinates (logical/mem coordinates) to screen coordinates (display).
         
-        Grid space: (0, 0) at top-left, extends to (grid_width, grid_height)
-        Screen space: (0, 0) at top-left of canvas widget
+        COORDINATE SYSTEM:
+        - Grid space (logical): Fixed (0,0) to (grid_width, grid_height) - e.g., (0,0) to (1200,800)
+        - Screen space (display): Variable (0,0) to (widget.width(), widget.height()) - changes with resize
+        - Drawable area: The actual area where content is drawn (maintains aspect ratio)
+        
+        The drawable area may be smaller than the widget due to letterboxing/pillarboxing
+        to maintain the correct aspect ratio.
+        
+        Example with letterboxing (widget wider than needed):
+        - Grid coords (600, 400) at center of 1200x800 grid
+        - Widget is 1000x600, but drawable area is 900x600 centered at offset (50, 0)
+        - Screen coords = (50, 0) + (600 * 900/1200, 400 * 600/800) = (500, 300)
         
         Args:
-            grid_x, grid_y: Coordinates in grid space (0 to DEFAULT_BEV_X, 0 to DEFAULT_BEV_Y)
+            grid_x, grid_y: Coordinates in grid space (0 to grid_width, 0 to grid_height)
             
         Returns:
-            QPointF with screen coordinates
+            QPointF with screen coordinates (includes drawable area offset)
         """
         try:
-            canvas_width = self.width()
-            canvas_height = self.height()
+            # Ensure drawable area is calculated
+            if self.draw_width == 0 or self.draw_height == 0:
+                self._calculate_drawable_area()
             
-            # Scale from grid space to canvas space
-            scale_x = canvas_width / self.grid_width
-            scale_y = canvas_height / self.grid_height
+            # Scale from grid space to drawable area
+            scale_x = self.draw_width / self.grid_width if self.grid_width > 0 else 1.0
+            scale_y = self.draw_height / self.grid_height if self.grid_height > 0 else 1.0
             
-            screen_x = grid_x * scale_x
-            screen_y = grid_y * scale_y
+            # Convert and add offset for letterboxing/pillarboxing
+            screen_x = self.draw_offset_x + (grid_x * scale_x)
+            screen_y = self.draw_offset_y + (grid_y * scale_y)
+            
             return QPointF(screen_x, screen_y)
         except Exception as e:
             logger.error(f"Error in _grid_to_screen({grid_x}, {grid_y}): {e}")
@@ -360,27 +429,46 @@ class BEVCanvas(QtWidgets.QWidget):
     
     def _screen_to_grid(self, screen_pos: QPointF) -> tuple[float, float]:
         """
-        Convert screen coordinates to grid coordinates (mem coordinates).
+        Convert screen coordinates (display) to grid coordinates (logical/mem coordinates).
         
-        Screen space: (0, 0) at top-left of canvas widget
-        Grid space: (0, 0) at top-left, extends to (grid_width, grid_height)
+        COORDINATE SYSTEM:
+        - Screen space (display): Variable (0,0) to (widget.width(), widget.height()) - changes with resize
+        - Drawable area: The actual area where content is drawn (maintains aspect ratio)
+        - Grid space (logical): Fixed (0,0) to (grid_width, grid_height) - e.g., (0,0) to (1200,800)
+        
+        The drawable area may be smaller than the widget due to letterboxing/pillarboxing.
+        Clicks outside the drawable area are clamped to the nearest edge.
+        
+        Example with letterboxing:
+        - Click at screen (500, 300), widget is 1000x600, drawable area is 900x600 at offset (50, 0)
+        - Relative to drawable: (500-50, 300-0) = (450, 300)
+        - Grid coords = (450 * 1200/900, 300 * 800/600) = (600, 400)
         
         Args:
             screen_pos: Position in screen/canvas coordinates
             
         Returns:
-            (grid_x, grid_y): Coordinates in grid space
+            (grid_x, grid_y): Coordinates in grid space (logical coordinates for storage)
         """
         try:
-            canvas_width = self.width()
-            canvas_height = self.height()
+            # Ensure drawable area is calculated
+            if self.draw_width == 0 or self.draw_height == 0:
+                self._calculate_drawable_area()
             
-            # Scale from canvas space to grid space
-            scale_x = self.grid_width / canvas_width
-            scale_y = self.grid_height / canvas_height
+            # Subtract offset to get position relative to drawable area
+            relative_x = screen_pos.x() - self.draw_offset_x
+            relative_y = screen_pos.y() - self.draw_offset_y
             
-            grid_x = screen_pos.x() * scale_x
-            grid_y = screen_pos.y() * scale_y
+            # Scale from drawable area to grid space
+            scale_x = self.grid_width / self.draw_width if self.draw_width > 0 else 1.0
+            scale_y = self.grid_height / self.draw_height if self.draw_height > 0 else 1.0
+            
+            grid_x = relative_x * scale_x
+            grid_y = relative_y * scale_y
+            
+            # Clamp to valid grid range (in case click was outside drawable area)
+            grid_x = max(0, min(self.grid_width, grid_x))
+            grid_y = max(0, min(self.grid_height, grid_y))
             
             return grid_x, grid_y
         except Exception as e:
@@ -422,30 +510,47 @@ class BEVCanvas(QtWidgets.QWidget):
         return None
     
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        """Paint BEV view"""
+        """Paint BEV view with proper aspect ratio maintenance"""
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         
-        # Draw background first (BEV overlay if available, otherwise flat gray)
+        # Ensure drawable area is calculated
+        if self.draw_width == 0 or self.draw_height == 0:
+            self._calculate_drawable_area()
+        
+        # Fill entire widget with black (for letterboxing/pillarboxing areas)
+        p.fillRect(self.rect(), QtGui.QColor(0, 0, 0))
+        
+        # Define the drawable rectangle (maintains aspect ratio)
+        draw_rect = QtCore.QRect(
+            self.draw_offset_x,
+            self.draw_offset_y,
+            self.draw_width,
+            self.draw_height
+        )
+        
+        # Draw background in drawable area (BEV overlay if available, otherwise gray)
         if self.background_image is not None and not self.background_image.isNull():
-            target_rect = self.rect()
             pixmap = QtGui.QPixmap.fromImage(self.background_image)
+            
+            # Scale to fit drawable area exactly (maintaining aspect ratio)
             scaled = pixmap.scaled(
-                target_rect.size(),
-                Qt.KeepAspectRatioByExpanding,
+                draw_rect.size(),
+                Qt.KeepAspectRatio,  # Changed from KeepAspectRatioByExpanding
                 Qt.SmoothTransformation,
             )
-            src_x = max(0, (scaled.width() - target_rect.width()) // 2)
-            src_y = max(0, (scaled.height() - target_rect.height()) // 2)
-            src_rect = QtCore.QRect(src_x, src_y, target_rect.width(), target_rect.height())
+            
+            # Center the scaled image in the drawable rect if there's any size mismatch
+            draw_x = self.draw_offset_x + (self.draw_width - scaled.width()) // 2
+            draw_y = self.draw_offset_y + (self.draw_height - scaled.height()) // 2
 
             p.save()
             p.setOpacity(self.background_alpha)
-            p.drawPixmap(target_rect, scaled, src_rect)
+            p.drawPixmap(draw_x, draw_y, scaled)
             p.restore()
         else:
-            # Fallback: flat dark background (should not be hit if BEV overlay is set)
-            p.fillRect(self.rect(), QtGui.QColor(30, 30, 30))
+            # Fallback: flat dark gray background in drawable area
+            p.fillRect(draw_rect, QtGui.QColor(30, 30, 30))
         
         # Draw grid - only within visible widget bounds to avoid overflow.
         # Keep it very subtle so BEV overlay is clearly visible.

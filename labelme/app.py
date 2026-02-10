@@ -5776,6 +5776,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bev_canvas = BEVCanvas(self)
         self.bev_canvas.setBEVParams(width=bev_width, height=bev_height, scale=bev_scale)
         
+        # IMPORTANT: Set grid dimensions to match the logical coordinate space
+        # This ensures proper coordinate transformation when the canvas is resized
+        self.bev_canvas.setGridDimensions(int(self._bev_x), int(self._bev_y))
+        logger.info(f"BEV grid dimensions set to {self._bev_x} x {self._bev_y}")
+        
         # Set color shift to match app config for consistent colors
         self.bev_canvas.setColorShift(self._config["shift_auto_shape_color"])
         
