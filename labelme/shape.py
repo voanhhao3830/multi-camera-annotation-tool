@@ -25,7 +25,7 @@ class Shape:
     # Flag for all other handles on the current shape
     NEAR_VERTEX = 1
 
-    PEN_WIDTH = 2
+    PEN_WIDTH = 4
 
     # The following class variables influence the drawing of all shape objects.
     line_color: QtGui.QColor = QtGui.QColor(0, 255, 0, 128)

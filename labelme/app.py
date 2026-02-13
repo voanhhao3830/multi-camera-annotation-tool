@@ -407,6 +407,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Start drawing rectangles"),
             enabled=False,
         )
+        pointerMode = action(
+            self.tr("Pointer Mode"),
+            lambda: self._switch_canvas_mode(edit=True, createMode=None),
+            "Esc",
+            icon="arrow-fat-right.svg",
+            tip=self.tr("Exit drawing mode and return to pointer/selection mode"),
+            enabled=True,
+        )
         # createCircleMode = action(
         #     self.tr("Create Circle"),
         #     lambda: self._switch_canvas_mode(edit=False, createMode="circle"),
@@ -723,6 +731,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # createMode=createMode,
             editMode=editMode,
             createRectangleMode=createRectangleMode,
+            pointerMode=pointerMode,
             # createCircleMode=createCircleMode,
             # createLineMode=createLineMode,
             createPointMode=createPointMode,
@@ -970,7 +979,7 @@ class MainWindow(QtWidgets.QMainWindow):
             Qt.LeftToolBarArea,
             ToolBar(
                 title="CreateShapeTools",
-                actions=[a for _, a in self.draw_actions],
+                actions=[pointerMode] + [a for _, a in self.draw_actions],
                 orientation=Qt.Vertical,
                 button_style=Qt.ToolButtonTextUnderIcon,
                 font_base=self.font(),
@@ -1171,17 +1180,42 @@ class MainWindow(QtWidgets.QMainWindow):
         return window_title
 
     def setDirty(self):
+        """Mark as dirty and auto-save if enabled"""
         # Even if we autosave the file, we keep the ability to undo
-        self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
+        if hasattr(self, 'canvas') and self.canvas:
+            self.actions.undo.setEnabled(self.canvas.isShapeRestorable)
 
+        # Auto-save logic
         if self._config["auto_save"] or self.actions.saveAuto.isChecked():
-            assert self.imagePath
-            label_file = f"{osp.splitext(self.imagePath)[0]}.json"
-            if self.output_dir:
-                label_file_without_path = osp.basename(label_file)
-                label_file = osp.join(self.output_dir, label_file_without_path)
-            self.saveLabels(label_file)
+            # For multi-camera mode, auto-save to global annotations
+            if self.is_multi_camera_mode and self.multi_camera_canvas:
+                try:
+                    self._save_global_annotations()
+                    logger.info("Auto-saved multi-camera annotations")
+                except Exception as e:
+                    logger.error(f"Failed to auto-save multi-camera annotations: {e}")
+                    import traceback
+                    traceback.print_exc()
+                return
+            
+            # For single camera mode, save to image-specific JSON
+            if self.imagePath:
+                try:
+                    label_file = f"{osp.splitext(self.imagePath)[0]}.json"
+                    if self.output_dir:
+                        label_file_without_path = osp.basename(label_file)
+                        label_file = osp.join(self.output_dir, label_file_without_path)
+                    self.saveLabels(label_file)
+                    logger.info(f"Auto-saved to {label_file}")
+                except Exception as e:
+                    logger.error(f"Failed to auto-save: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                logger.debug("Auto-save skipped: no imagePath set")
             return
+            
+        # If auto-save is disabled, mark as dirty
         self._is_changed = True
         self.actions.save.setEnabled(True)
         self.setWindowTitle(self._get_window_title(dirty=True))
@@ -5611,6 +5645,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.multi_camera_canvas.mouseMoved.connect(self._update_status_stats)
         self.multi_camera_canvas.statusUpdated.connect(lambda text: self.status_left.setText(text))
         
+        # Enable auto-save by default for multi-camera mode
+        if not self._config["auto_save"]:
+            logger.info("Enabling auto-save for multi-camera mode")
+            self.actions.saveAuto.setChecked(True)
+        
         # Replace canvas in scroll area
         scroll_area = self.centralWidget()
         scroll_area.setWidget(self.multi_camera_canvas)
@@ -6779,60 +6818,57 @@ class MainWindow(QtWidgets.QMainWindow):
             # Use clamped coordinates
             x_min, y_min, x_max, y_max = clamped_bbox
             
-            # If the user manually edited this box on this camera (from_bev == False),
-            # stop tracking it from BEV and do not create a new box for this camera.
-            skip_camera = False
-            for existing in cell.shapes:
-                if (
-                    existing.label == label
-                    and existing.group_id == group_id
-                    and not existing.other_data.get("from_bev", False)
-                ):
-                    skip_camera = True
-                    break
-            if skip_camera:
-                logger.debug(
-                    f"Skip projection for camera {camera_id} because manual-edited box exists"
-                )
-                continue
+            # Check if box already exists for this camera
+            # Priority:
+            # 1. If manually-edited box exists (from_bev=False), UPDATE it to keep it synced
+            # 2. If BEV-projected box exists (from_bev=True), UPDATE it
+            # 3. Otherwise, CREATE new box
+            existing_shape = None
+            is_manual_box = False
             
-            # Check if box is outside bounds - remove existing shape if it exists
-            if x_min < 0 or y_min < 0 or x_max > img_w or y_max > img_h:
-                logger.debug(f"Box outside image bounds for camera {camera_id}, removing projection")
-                # Remove existing BEV-projected shape if it exists
-                shapes_to_remove = []
-                for shape in cell.shapes:
-                    if (shape.label == label and shape.group_id == group_id and 
-                        shape.other_data.get("from_bev", False)):
-                        shapes_to_remove.append(shape)
+            for existing in cell.shapes:
+                # Check for box with matching group_id
+                if existing.group_id == group_id and existing.shape_type == "rectangle":
+                    if not existing.other_data.get("from_bev", False):
+                        # Manual box exists - update it and keep it as manual
+                        existing_shape = existing
+                        is_manual_box = True
+                        logger.debug(f"Found manual box for group_id={group_id} in camera {camera_id}, will update")
+                        break
+                    else:
+                        # BEV-projected box exists - update it
+                        existing_shape = existing
+                        is_manual_box = False
+            
+            if existing_shape is not None:
+                # Update existing shape (manual or BEV-projected)
+                logger.debug(f"Updating existing {'manual' if is_manual_box else 'BEV'} box for group_id={group_id} in camera {camera_id}")
                 
-                for shape in shapes_to_remove:
-                    cell.shapes.remove(shape)
-                    self.remLabels([shape])
+                # Update the bounding box coordinates
+                if len(existing_shape.points) >= 2:
+                    existing_shape.points[0] = QtCore.QPointF(x_min, y_min)
+                    existing_shape.points[1] = QtCore.QPointF(x_max, y_max)
+                elif len(existing_shape.points) == 4:
+                    # 4-corner rectangle
+                    existing_shape.points[0] = QtCore.QPointF(x_min, y_min)
+                    existing_shape.points[1] = QtCore.QPointF(x_max, y_min)
+                    existing_shape.points[2] = QtCore.QPointF(x_max, y_max)
+                    existing_shape.points[3] = QtCore.QPointF(x_min, y_max)
+                
+                # Keep the from_bev flag as it was (don't override manual boxes)
+                if not is_manual_box:
+                    existing_shape.other_data["from_bev"] = True
                 
                 self.multi_camera_canvas.camera_cells[idx] = cell
-                continue
-
-            # Check if box already exists for this camera (only BEV-projected boxes)
-            # Only update if shape exists and is from BEV
-            existing_shape = None
-            for existing in cell.shapes:
-                # Only update if it's a BEV-projected box with matching label/group_id
-                if (existing.label == label and existing.group_id == group_id and 
-                    existing.other_data.get("from_bev", False)):
-                    existing_shape = existing
-                    break
-            
-            if existing_shape is None:
-                # Create new rectangle shape from bounding box
-                # Use rectangle shape type for simplicity, but ensure correct orientation
+                self.multi_camera_canvas.update()
+            else:
+                # Create new rectangle shape
+                logger.debug(f"Creating new BEV box for group_id={group_id} in camera {camera_id}")
                 shape = Shape(
                     label=label,
                     shape_type="rectangle",
                     group_id=group_id,
                 )
-                # Rectangle shape: two points define the rectangle
-                # Ensure points are ordered correctly (top-left to bottom-right)
                 shape.addPoint(QtCore.QPointF(x_min, y_min))
                 shape.addPoint(QtCore.QPointF(x_max, y_max))
                 shape.close()
@@ -6846,14 +6882,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 # Add to label list
                 self.addLabel(shape)
-            else:
-                # Update existing BEV-projected shape
-                # Ensure points are ordered correctly
-                existing_shape.points[0] = QtCore.QPointF(x_min, y_min)
-                existing_shape.points[1] = QtCore.QPointF(x_max, y_max)
-                existing_shape.other_data["from_bev"] = True
-                self.multi_camera_canvas.camera_cells[idx] = cell
-                self.multi_camera_canvas.update()
         
         self.multi_camera_canvas.update()
         self.setDirty()
