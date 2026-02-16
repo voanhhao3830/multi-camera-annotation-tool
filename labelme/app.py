@@ -175,6 +175,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # Action zone mapper for automatic action assignment
         self.action_zone_mapper = None
         
+        # Storage for inferred bounding boxes: {frame_idx: {camera_id: [{"bbox": [x1,y1,x2,y2], "confidence": float, "class": str}, ...]}}
+        self.inferred_bboxes: dict[int, dict[str, list[dict]]] = {}
+        
+        # Cache for hover inference recommendations
+        self._hover_inference_cache: dict[str, dict] = {}
+        self._inference_overlay_shapes: list[tuple[int, Shape]] = []
+        
+        # Single camera inference overlay
+        self._single_camera_inference_overlay: Optional[Shape] = None
+        
         # Ground Point List (replaces flags widget)
         self.ground_point_dock = QtWidgets.QDockWidget(self.tr("Ground Points (BEV)"), self)
         self.ground_point_dock.setObjectName("GroundPoints")
@@ -247,6 +257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.canvas.zoomRequest.connect(self._zoom_requested)
         self.canvas.mouseMoved.connect(self._update_status_stats)
+        self.canvas.mouseMoved.connect(self._show_inference_overlay_on_canvas)
         self.canvas.statusUpdated.connect(lambda text: self.status_left.setText(text))
 
         scrollArea = QtWidgets.QScrollArea()
@@ -935,6 +946,15 @@ class MainWindow(QtWidgets.QMainWindow):
             tip=self.tr("Run preprocessing to assign consistent IDs across frames"),
         )
         
+        # BBox inference action
+        bboxInferenceAction = action(
+            self.tr("BBox\nInference"),
+            self.runBBoxInference,
+            None,
+            icon="ai-polygon.svg",
+            tip=self.tr("Run bounding box inference on all cameras"),
+        )
+        
         # Copy labels from previous frame action
         copyPrevLabelsAction = action(
             self.tr("Copy Prev\nLabels"),
@@ -957,6 +977,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     deleteFile,
                     None,
                     preprocessAction,
+                    bboxInferenceAction,
                     copyPrevLabelsAction,
                     None,
                     editMode,
@@ -1136,6 +1157,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.zoomWidget.valueChanged.connect(self._paint_canvas)
 
         self.populateModeActions()
+        
+        # Set up timer to periodically try loading inference data
+        self._inference_load_timer = QtCore.QTimer()
+        self._inference_load_timer.timeout.connect(self._try_load_inference)
+        self._inference_load_timer.start(2000)  # Check every 2 seconds
 
     def menu(self, title, actions=None):
         menu = self.menuBar().addMenu(title)
@@ -3778,6 +3804,413 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             progress.close()
     
+    def runBBoxInference(self) -> None:
+        """Run bounding box inference on all cameras and save results"""
+        if not self.is_multi_camera_mode or not hasattr(self, "_aicv_root_dir") or not self._aicv_root_dir:
+            QMessageBox.warning(
+                self,
+                "BBox Inference",
+                "BBox Inference is only available in multi-camera mode with AICV structure."
+            )
+            return
+        
+        try:
+            from ultralytics import YOLO
+            import glob
+            
+            # Get model path from user
+            model_path, ok = QtWidgets.QInputDialog.getText(
+                self,
+                "Select YOLO Model",
+                "Enter YOLO model path (e.g., yolov8n.pt, yolov8s.pt, yolov8m.pt):",
+                text="yolov8n.pt"
+            )
+            if not ok or not model_path:
+                return
+            
+            # Get confidence threshold from user
+            conf_threshold, ok = QtWidgets.QInputDialog.getDouble(
+                self,
+                "Confidence Threshold",
+                "Enter confidence threshold (0.0-1.0):",
+                value=0.25,
+                min=0.0,
+                max=1.0,
+                decimals=2
+            )
+            if not ok:
+                return
+            
+            root_dir = self._aicv_root_dir
+            image_subsets_folder = osp.join(root_dir, "Image_subsets")
+            
+            if not osp.exists(image_subsets_folder):
+                QMessageBox.warning(
+                    self,
+                    "BBox Inference",
+                    f"Image_subsets folder not found: {image_subsets_folder}"
+                )
+                return
+            
+            # Get all camera folders
+            camera_folders = sorted([d for d in os.listdir(image_subsets_folder)
+                                   if osp.isdir(osp.join(image_subsets_folder, d))])
+            
+            if not camera_folders:
+                QMessageBox.warning(
+                    self,
+                    "BBox Inference",
+                    "No camera folders found in Image_subsets"
+                )
+                return
+            
+            # Create progress dialog
+            progress = QtWidgets.QProgressDialog(
+                f"Running bounding box inference with {model_path} (conf={conf_threshold})...", 
+                "Cancel", 
+                0, 
+                100, 
+                self
+            )
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            QtWidgets.QApplication.processEvents()
+            
+            # Load YOLO model
+            logger.info(f"Loading YOLO model: {model_path}")
+            model = YOLO(model_path)
+            progress.setValue(5)
+            QtWidgets.QApplication.processEvents()
+            
+            # Clear existing inference data
+            self.inferred_bboxes = {}
+            
+            # Process each camera
+            total_cameras = len(camera_folders)
+            for cam_idx, cam_folder in enumerate(camera_folders):
+                if progress.wasCanceled():
+                    break
+                
+                cam_path = osp.join(image_subsets_folder, cam_folder)
+                logger.info(f"Processing camera: {cam_folder} ({cam_idx + 1}/{total_cameras})")
+                
+                # Get all images in this camera folder
+                image_files = sorted(
+                    glob.glob(osp.join(cam_path, "*.jpg")) +
+                    glob.glob(osp.join(cam_path, "*.png")) +
+                    glob.glob(osp.join(cam_path, "*.jpeg"))
+                )
+                
+                if not image_files:
+                    continue
+                
+                # Run inference on all images in this camera
+                total_images = len(image_files)
+                for img_idx, img_path in enumerate(image_files):
+                    if progress.wasCanceled():
+                        break
+                    
+                    # Extract frame index from filename
+                    filename = osp.basename(img_path)
+                    try:
+                        # Assuming format: 00000.jpg, 00001.jpg, etc.
+                        frame_idx = int(osp.splitext(filename)[0])
+                    except ValueError:
+                        logger.warning(f"Could not parse frame index from: {filename}")
+                        continue
+                    
+                    # Run YOLO inference
+                    try:
+                        results = model(img_path, conf=conf_threshold, verbose=False)
+                        
+                        # Extract bounding boxes
+                        bboxes = []
+                        if len(results) > 0:
+                            result = results[0]
+                            if result.boxes is not None:
+                                for box in result.boxes:
+                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                    conf = float(box.conf[0].cpu().numpy())
+                                    cls = int(box.cls[0].cpu().numpy())
+                                    class_name = model.names[cls]
+                                    
+                                    bboxes.append({
+                                        "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                                        "confidence": conf,
+                                        "class": class_name
+                                    })
+                        
+                        # Store results
+                        if frame_idx not in self.inferred_bboxes:
+                            self.inferred_bboxes[frame_idx] = {}
+                        self.inferred_bboxes[frame_idx][cam_folder] = bboxes
+                        
+                    except Exception as e:
+                        logger.error(f"Inference failed for {img_path}: {e}")
+                        continue
+                    
+                    # Update progress
+                    cam_progress = int(5 + (cam_idx / total_cameras) * 85)
+                    img_progress = int((img_idx + 1) / total_images * (85 / total_cameras))
+                    progress.setValue(cam_progress + img_progress)
+                    QtWidgets.QApplication.processEvents()
+            
+            # Save inference results to JSON file
+            progress.setValue(95)
+            QtWidgets.QApplication.processEvents()
+            
+            inference_output_path = osp.join(root_dir, "bbox_inference.json")
+            logger.info(f"Saving inference results to: {inference_output_path}")
+            
+            with open(inference_output_path, 'w') as f:
+                json.dump(self.inferred_bboxes, f, indent=2)
+            
+            progress.setValue(100)
+            QtWidgets.QApplication.processEvents()
+            
+            QMessageBox.information(
+                self,
+                "BBox Inference Complete",
+                f"Bounding box inference completed!\n\n"
+                f"Model: {model_path}\n"
+                f"Confidence: {conf_threshold}\n"
+                f"Total frames: {len(self.inferred_bboxes)}\n"
+                f"Cameras: {len(camera_folders)}\n\n"
+                f"Results saved to:\n{inference_output_path}"
+            )
+            
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "Import Error",
+                f"Could not import ultralytics YOLO:\n{str(e)}\n\n"
+                f"Please install: pip install ultralytics"
+            )
+        except Exception as e:
+            logger.error(f"BBox inference failed: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self,
+                "BBox Inference Error",
+                f"BBox inference failed:\n{str(e)}"
+            )
+        finally:
+            progress.close()
+    
+    def _calculate_iou(self, box1: list[float], box2: list[float]) -> float:
+        """Calculate Intersection over Union (IOU) between two bounding boxes
+        
+        Args:
+            box1: [x1, y1, x2, y2] format
+            box2: [x1, y1, x2, y2] format
+            
+        Returns:
+            IOU score (0.0 to 1.0)
+        """
+        # Get coordinates
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        # Calculate intersection area
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        
+        # Calculate union area
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area == 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
+    def _find_best_matching_bbox(
+        self, 
+        projected_bbox: list[float], 
+        inferred_bboxes: list[dict],
+        iou_threshold: float = 0.3
+    ) -> tuple[Optional[list[float]], float]:
+        """Find the best matching inferred bbox based on IOU
+        
+        Args:
+            projected_bbox: [x1, y1, x2, y2] from BEV projection
+            inferred_bboxes: List of inferred bbox dicts with "bbox", "confidence", "class"
+            iou_threshold: Minimum IOU to consider a match
+            
+        Returns:
+            Tuple of (best_bbox [x1,y1,x2,y2], best_iou) or (None, 0.0) if no match
+        """
+        best_bbox = None
+        best_iou = 0.0
+        
+        for inferred in inferred_bboxes:
+            inferred_bbox = inferred["bbox"]
+            iou = self._calculate_iou(projected_bbox, inferred_bbox)
+            
+            if iou > best_iou and iou >= iou_threshold:
+                best_iou = iou
+                best_bbox = inferred_bbox
+        
+        return best_bbox, best_iou
+    
+    def _load_bbox_inference(self) -> bool:
+        """Load bbox inference results from JSON file
+        
+        Returns:
+            True if loaded successfully, False otherwise
+        """
+        # Try multiple locations for inference file
+        inference_path = None
+        
+        # First try AICV root dir (multi-camera mode)
+        if hasattr(self, "_aicv_root_dir") and self._aicv_root_dir:
+            inference_path = osp.join(self._aicv_root_dir, "bbox_inference.json")
+        
+        # Try previous opened directory (single camera mode)
+        elif self._prev_opened_dir:
+            inference_path = osp.join(self._prev_opened_dir, "bbox_inference.json")
+        
+        # Try current file's directory
+        elif self.filename:
+            file_dir = osp.dirname(self.filename)
+            inference_path = osp.join(file_dir, "bbox_inference.json")
+        
+        if not inference_path or not osp.exists(inference_path):
+            logger.debug(f"No bbox inference file found at: {inference_path}")
+            return False
+        
+        try:
+            with open(inference_path, 'r') as f:
+                loaded_data = json.load(f)
+            
+            # Convert string keys to int for frame indices
+            self.inferred_bboxes = {int(k): v for k, v in loaded_data.items()}
+            logger.info(f"Loaded bbox inference for {len(self.inferred_bboxes)} frames from {inference_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load bbox inference: {e}")
+            return False
+    
+    def _try_load_inference(self):
+        """Periodically try to load inference data if not already loaded"""
+        if not hasattr(self, 'inferred_bboxes') or not self.inferred_bboxes:
+            self._load_bbox_inference()
+    
+    def _show_inference_overlay_on_canvas(self, mouse_pos: QPointF):
+        """Show inference overlay on regular canvas (single camera mode)"""
+        # Only work in single camera mode
+        if self.is_multi_camera_mode:
+            return
+        
+        # Check if we have inference data
+        if not hasattr(self, 'inferred_bboxes') or not self.inferred_bboxes:
+            # Try to load if not already loaded
+            self._load_bbox_inference()
+            if not self.inferred_bboxes:
+                return
+        
+        # Get current frame index
+        frame_idx = self._get_current_frame_index()
+        if frame_idx not in self.inferred_bboxes:
+            # Clear any existing overlay
+            if self._single_camera_inference_overlay:
+                if self._single_camera_inference_overlay in self.canvas.shapes:
+                    self.canvas.shapes.remove(self._single_camera_inference_overlay)
+                self._single_camera_inference_overlay = None
+                self.canvas.update()
+            return
+        
+        # Get camera ID - for single camera mode, use first available or "Camera0"
+        camera_ids = list(self.inferred_bboxes[frame_idx].keys())
+        if not camera_ids:
+            return
+        
+        # Try to match filename to camera_id
+        camera_id = camera_ids[0]  # Default to first camera
+        if self.filename:
+            # Extract camera ID from filename if possible (e.g., Camera1/00000.jpg -> Camera1)
+            filename_parts = self.filename.split(os.sep)
+            for part in filename_parts:
+                if part in camera_ids:
+                    camera_id = part
+                    break
+        
+        # Get inferred bboxes for this camera
+        inferred_bboxes = self.inferred_bboxes[frame_idx][camera_id]
+        if not inferred_bboxes:
+            # Clear overlay
+            if self._single_camera_inference_overlay:
+                if self._single_camera_inference_overlay in self.canvas.shapes:
+                    self.canvas.shapes.remove(self._single_camera_inference_overlay)
+                self._single_camera_inference_overlay = None
+                self.canvas.update()
+            return
+        
+        # Find the bbox closest to mouse cursor
+        best_bbox = None
+        best_distance = float('inf')
+        best_conf = 0.0
+        best_class = ""
+        
+        for inferred in inferred_bboxes:
+            bbox = inferred["bbox"]
+            x1, y1, x2, y2 = bbox
+            
+            # Calculate center of bbox
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+            
+            # Calculate distance from mouse to bbox center
+            dx = mouse_pos.x() - center_x
+            dy = mouse_pos.y() - center_y
+            distance = (dx * dx + dy * dy) ** 0.5
+            
+            # Check if mouse is inside or near the bbox
+            if distance < best_distance and distance < 200:  # Within 200 pixels
+                best_distance = distance
+                best_bbox = bbox
+                best_conf = inferred["confidence"]
+                best_class = inferred["class"]
+        
+        # Remove old overlay
+        if self._single_camera_inference_overlay:
+            if self._single_camera_inference_overlay in self.canvas.shapes:
+                self.canvas.shapes.remove(self._single_camera_inference_overlay)
+            self._single_camera_inference_overlay = None
+        
+        # Create new overlay if we found a bbox
+        if best_bbox is not None:
+            x1, y1, x2, y2 = best_bbox
+            
+            overlay_shape = Shape(
+                label=f"{best_class} (IOU: {best_conf:.2f})",
+                shape_type="rectangle",
+                group_id=None,
+            )
+            overlay_shape.addPoint(QPointF(x1, y1))
+            overlay_shape.addPoint(QPointF(x2, y2))
+            overlay_shape.close()
+            
+            # Set overlay style: semi-transparent cyan
+            overlay_shape.line_color = QtGui.QColor(0, 255, 255, 200)  # Cyan
+            overlay_shape.fill_color = QtGui.QColor(0, 255, 255, 40)   # Light cyan fill
+            overlay_shape.other_data["is_inference_overlay"] = True
+            
+            # Add to canvas
+            self.canvas.shapes.append(overlay_shape)
+            self._single_camera_inference_overlay = overlay_shape
+            self.canvas.update()
+    
     def _get_current_frame_index(self) -> int:
         """Get current frame index from filename"""
         if not self.filename:
@@ -5650,6 +6083,9 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.info("Enabling auto-save for multi-camera mode")
             self.actions.saveAuto.setChecked(True)
         
+        # Try to load bbox inference results if available
+        self._load_bbox_inference()
+        
         # Replace canvas in scroll area
         scroll_area = self.centralWidget()
         scroll_area.setWidget(self.multi_camera_canvas)
@@ -5869,6 +6305,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bev_canvas.pointMoved.connect(self._on_bev_point_moved)
         self.bev_canvas.pointLocked.connect(self._on_bev_point_locked)
         self.bev_canvas.mousePositionChanged.connect(self._on_bev_mouse_position_changed)
+        self.bev_canvas.mousePositionChanged.connect(self._on_bev_mouse_hover_show_inference)
         
         # Create dock widget for BEV with step size control
         bev_dock = QtWidgets.QDockWidget("BEV View (3D Box Placement)", self)
@@ -6330,6 +6767,140 @@ class MainWindow(QtWidgets.QMainWindow):
         # Then highlight shapes with matching group_id
         if group_id is not None:
             self._highlight_shapes_by_group_id(group_id, highlight=True)
+    
+    def _on_bev_mouse_hover_show_inference(self, grid_x: float, grid_y: float):
+        """Show recommended inferred bboxes when hovering anywhere on BEV"""
+        
+        # Check if mouse left BEV (NaN values)
+        if np.isnan(grid_x) or np.isnan(grid_y):
+            # Clear overlays
+            if hasattr(self, '_inference_overlay_shapes'):
+                for cam_idx, shape in self._inference_overlay_shapes:
+                    cell = self.multi_camera_canvas.camera_cells[cam_idx]
+                    if shape in cell.shapes:
+                        cell.shapes.remove(shape)
+                self._inference_overlay_shapes = []
+                if self.multi_camera_canvas:
+                    self.multi_camera_canvas.update()
+            return
+        
+        if not self.multi_camera_canvas or not self.multi_camera_data:
+            return
+        
+        # Only show if we have inference data
+        if not hasattr(self, 'inferred_bboxes') or not self.inferred_bboxes:
+            return
+        
+        # Clear previous overlay
+        if not hasattr(self, '_inference_overlay_shapes'):
+            self._inference_overlay_shapes = []
+        
+        # Remove old overlay shapes
+        for cam_idx, shape in self._inference_overlay_shapes:
+            cell = self.multi_camera_canvas.camera_cells[cam_idx]
+            if shape in cell.shapes:
+                cell.shapes.remove(shape)
+        self._inference_overlay_shapes = []
+        
+        # Store the current hover position and recommended bboxes for use when placing point
+        self._hover_inference_cache = {}
+        
+        # Get current frame
+        frame_idx = self._get_current_frame_index()
+        if frame_idx not in self.inferred_bboxes:
+            logger.warning(f"No inferred bboxes found for frame {frame_idx} in {self.inferred_bboxes.keys()}")
+            # Silently return if frame not in inference data
+            return
+        
+        # grid_x and grid_y are already in grid coordinates (memory coordinates from BEV canvas)
+        # No need to convert - they can be used directly
+        mem_x, mem_y = grid_x, grid_y
+        
+        # For each camera, show the best matching inferred bbox
+        for idx, cam_data in enumerate(self.multi_camera_data):
+            camera_id = cam_data["camera_id"]
+            calibration = self.camera_calibrations.get(camera_id)
+            
+            # Check if we have inference for this camera (handle both "Camera11" and "11" formats)
+            inference_key = camera_id
+            if camera_id not in self.inferred_bboxes[frame_idx]:
+                # Try without "Camera" prefix
+                if camera_id.startswith("Camera"):
+                    inference_key = camera_id.replace("Camera", "")
+                    if inference_key not in self.inferred_bboxes[frame_idx]:
+                        continue
+                else:
+                    continue
+            
+            if not calibration:
+                continue
+            
+            # Project the BEV position to this camera to get projected bbox
+            center_3d = np.array([mem_x, mem_y, 0.0])
+            size_3d = np.array([DEFAULT_BOX_SIZE, DEFAULT_BOX_SIZE, DEFAULT_BOX_SIZE])
+            
+            corners_2d = calibration.project_3d_box_to_2d(center_3d, size_3d, rotation=0.0)
+            if corners_2d is None:
+                continue
+            
+            valid_corners = corners_2d[~np.isnan(corners_2d).any(axis=1)]
+            if len(valid_corners) == 0:
+                continue
+            
+            # Get projected bbox
+            proj_x_min = np.min(valid_corners[:, 0])
+            proj_y_min = np.min(valid_corners[:, 1])
+            proj_x_max = np.max(valid_corners[:, 0])
+            proj_y_max = np.max(valid_corners[:, 1])
+            
+            cell = self.multi_camera_canvas.camera_cells[idx]
+            img_w = cell.image.width()
+            img_h = cell.image.height()
+            
+            # Clamp to image bounds
+            clamped_bbox = self._clamp_bbox_to_image_bounds(proj_x_min, proj_y_min, proj_x_max, proj_y_max, img_w, img_h)
+            if clamped_bbox is None:
+                continue
+            
+            proj_x_min, proj_y_min, proj_x_max, proj_y_max = clamped_bbox
+            projected_bbox = [proj_x_min, proj_y_min, proj_x_max, proj_y_max]
+            
+            # Find best matching inferred bbox (use inference_key which might be different from camera_id)
+            inferred_bboxes = self.inferred_bboxes[frame_idx][inference_key]
+            best_bbox, best_iou = self._find_best_matching_bbox(
+                projected_bbox,
+                inferred_bboxes,
+                iou_threshold=0.1  # Lower threshold for preview
+            )
+            if best_bbox is not None:
+                # Cache this for use when placing point
+                self._hover_inference_cache[camera_id] = {
+                    'bbox': best_bbox,
+                    'iou': best_iou
+                }
+                
+                # Create temporary overlay shape
+                overlay_shape = Shape(
+                    label=f"Inferred (IOU:{best_iou:.2f})",
+                    shape_type="rectangle",
+                    group_id=None,  # No group_id for overlay
+                )
+                x1, y1, x2, y2 = best_bbox
+                overlay_shape.addPoint(QtCore.QPointF(x1, y1))
+                overlay_shape.addPoint(QtCore.QPointF(x2, y2))
+                overlay_shape.close()
+                
+                # Set overlay style: semi-transparent cyan/blue
+                overlay_shape.line_color = QtGui.QColor(0, 255, 255, 200)  # Cyan
+                overlay_shape.fill_color = QtGui.QColor(0, 255, 255, 40)   # Light cyan fill
+                overlay_shape.other_data["is_inference_overlay"] = True
+                
+                # Add to camera cell
+                cell.shapes.append(overlay_shape)
+                self._inference_overlay_shapes.append((idx, overlay_shape))
+            # If no match, don't show any overlay (removed yellow projected box)
+        
+        self.multi_camera_canvas.update()
 
     def _clear_all_shape_highlights(self):
         """Clear all shape highlights in camera views"""
@@ -6817,6 +7388,42 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Use clamped coordinates
             x_min, y_min, x_max, y_max = clamped_bbox
+            
+            # First check if we have cached inference from hover
+            if (hasattr(self, '_hover_inference_cache') and 
+                camera_id in self._hover_inference_cache):
+                cached = self._hover_inference_cache[camera_id]
+                x_min, y_min, x_max, y_max = cached['bbox']
+                logger.debug(f"Using cached hover inference (IOU={cached['iou']:.3f}) for camera {camera_id}")
+            else:
+                # Try to find best matching inferred bbox based on IOU
+                frame_idx = self._get_current_frame_index()
+                if (hasattr(self, 'inferred_bboxes') and 
+                    frame_idx in self.inferred_bboxes):
+                    
+                    # Check if we have inference for this camera (handle both "Camera11" and "11" formats)
+                    inference_key = camera_id
+                    if camera_id not in self.inferred_bboxes[frame_idx]:
+                        # Try without "Camera" prefix
+                        if camera_id.startswith("Camera"):
+                            inference_key = camera_id.replace("Camera", "")
+                    
+                    if inference_key in self.inferred_bboxes[frame_idx]:
+                        inferred_bboxes = self.inferred_bboxes[frame_idx][inference_key]
+                        projected_bbox = [x_min, y_min, x_max, y_max]
+                        
+                        best_bbox, best_iou = self._find_best_matching_bbox(
+                            projected_bbox, 
+                            inferred_bboxes,
+                            iou_threshold=0.3
+                        )
+                        
+                        if best_bbox is not None:
+                            # Use inferred bbox instead of projected
+                            x_min, y_min, x_max, y_max = best_bbox
+                            logger.debug(f"Using inferred bbox (IOU={best_iou:.3f}) for group_id={group_id} in camera {camera_id}")
+                        else:
+                            logger.debug(f"No matching inferred bbox (best IOU < 0.3), using projected bbox for group_id={group_id} in camera {camera_id}")
             
             # Check if box already exists for this camera
             # Priority:
